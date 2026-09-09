@@ -1,0 +1,168 @@
+# Design Specification: `tpt-raglite`
+
+**Status:** Draft / RFC  
+**Project:** `tpt-raglite` (The "SQLite for AI")  
+**Ecosystem:** TPT Solutions  
+**Date:** September 2026  
+
+---
+
+## 1. Executive Summary
+
+`tpt-raglite` is a blazing-fast, embeddable, zero-configuration Retrieval-Augmented Generation (RAG) engine written in pure Rust. 
+
+Currently, adding semantic search or "chat with your docs" to an application requires a fragmented stack: a vector database (Chroma/Pinecone), an embedding server (OpenAI API or local PyTorch), and a chunking framework (LangChain). This requires Docker, cloud API keys, and heavy Python dependencies.
+
+`tpt-raglite` solves this by providing a single, statically compiled library that handles document parsing, local ONNX-based embeddings, smart chunking, and disk-backed vector indexing. It is designed to be embedded directly into Python, Node.js, C++, or WebAssembly applications with zero external infrastructure.
+
+## 2. Core Design Principles
+
+1. **Zero-Config & Offline-First:** No Docker, no API keys, no Python environment hell. It works out of the box, entirely offline, by bundling a lightweight ONNX embedding model.
+2. **Embeddable, Not a Server:** It is a library, not a microservice. It runs in the same process as the host application.
+3. **Multi-Language Native:** The core is pure Rust. It exposes a clean C ABI, allowing seamless, zero-copy (or near-zero-copy) integration with Python (`pip install`), JavaScript/WASM (`npm install`), and C/C++.
+4. **Memory & Disk Efficient:** Uses memory-mapped files for vector indices so it can handle millions of vectors without exhausting RAM.
+
+---
+
+## 3. Architecture Overview
+
+The project is structured as a Cargo workspace to strictly separate the pure math/engine logic from the Foreign Function Interface (FFI) boundaries.
+
+```text
+tpt-raglite/
+├── tpt-rag-core/          # Pure Rust. Parsing, chunking, ONNX inference, HNSW index.
+├── tpt-rag-ffi/           # C ABI boundary. Opaque handles, extern "C", error codes.
+├── tpt-rag-py/            # PyO3 wrapper. Generates the `tpt-raglite` Python wheel.
+├── tpt-rag-wasm/          # wasm-bindgen wrapper. Generates the JS/Browser package.
+├── models/                # Bundled, quantized ONNX models (e.g., all-MiniLM-L6-v2).
+└── tests/                 # Integration tests across all language boundaries.
+
+3.1 The "Layer Cake" Data Flow
+User Code (Python/JS/C++) calls add_document("file.pdf").
+Wrapper Layer (PyO3/WASM) translates the call to the FFI boundary.
+FFI Layer (tpt-rag-ffi) validates pointers, acquires locks, and calls the core.
+Core Layer (tpt-rag-core) executes the pipeline:
+Extracts text from PDF.
+Chunks text semantically.
+Runs chunks through the local ONNX embedding model.
+Writes vectors to the memory-mapped HNSW index.
+Writes metadata/text to the SQLite metadata store.
+4. Key Components & Implementation Details
+4.1 Ingestion Pipeline (Parsing & Chunking)
+Parsers: Use pdf-extract for PDFs, markup5ever for HTML, and native Rust string manipulation for Markdown/Text.
+Chunking Strategy:
+Base: Sliding window with overlap (e.g., 512 tokens, 50 token overlap).
+Advanced: Semantic chunking using sentence boundaries to avoid splitting mid-thought.
+Metadata Extraction: Automatically extracts file name, creation date, and custom user tags.
+4.2 Local Embedding Engine
+Technology: Uses the ort crate (Rust bindings for ONNX Runtime).
+Model: Bundles a quantized (INT8) version of all-MiniLM-L6-v2 (384 dimensions). This provides an excellent balance of speed and accuracy, requiring less than 100MB of RAM.
+Execution: Runs on CPU by default. Utilizes Rust's rayon for parallel batch embedding of chunks.
+4.3 Storage & Indexing
+Metadata Store: Embedded SQLite (via rusqlite). Stores the original text chunks, metadata, and mapping to vector IDs. Highly reliable, zero-config.
+Vector Index: Memory-mapped Hierarchical Navigable Small World (HNSW) graph.
+Implementation: Custom Rust implementation or wrapping usearch via FFI.
+Storage: Vectors and graph edges are written directly to a .bin file on disk. When querying, the OS handles paging the necessary parts of the graph into RAM.
+4.4 Retrieval & Reranking
+Search: K-Nearest Neighbors (KNN) search over the HNSW index.
+Reranking (Optional/Phase 2): Cross-encoder reranking using a secondary, smaller ONNX model to reorder the top-K results for maximum relevance.
+5. Target API Design (Developer Experience)
+The ultimate goal is that the user never sees the Rust code. The API must feel native to their language.
+5.1 Python API (via PyO3)
+
+from tpt_raglite import RAGLite
+
+# Initialize (creates a local directory 'my_app_db')
+rag = RAGLite("./my_app_db")
+
+# Ingest data (automatically parses PDFs, chunks, and embeds)
+rag.add_files(["./documentation/manual.pdf", "./notes.md"])
+
+# Query (returns the most relevant text chunks)
+results = rag.query("How do I configure the FFI boundary?")
+for chunk in results:
+    print(f"[{chunk.score:.2f}] {chunk.text}")
+
+5.2 JavaScript / Browser API (via WASM)
+
+import { RAGLite } from 'tpt-raglite-wasm';
+
+// Initialize in the browser (uses IndexedDB or OPFS for storage)
+const rag = await RAGLite.init('my_browser_db');
+
+// Ingest text directly from the DOM or API
+await rag.addText("User manual content...", { source: "web" });
+
+// Query
+const results = await rag.query("How does the WASM wrapper work?");
+console.log(results);
+
+5.3 C API (via tpt-rag-ffi)
+
+#include "tpt_raglite.h"
+
+int main() {
+    // Create instance
+    tpt_rag_handle* rag = tpt_rag_create("./my_c_db");
+    
+    // Add file
+    tpt_rag_add_file(rag, "manual.pdf");
+    
+    // Query
+    tpt_rag_result* results = NULL;
+    int count = tpt_rag_query(rag, "How to configure?", 5, &results);
+    
+    // Process results...
+    
+    // Cleanup
+    tpt_rag_free_results(results);
+    tpt_rag_destroy(rag);
+    return 0;
+}
+
+6. Performance & Resource Targets
+To truly be "embeddable," tpt-raglite must adhere to strict resource limits:
+Metric
+Target
+Rationale
+Binary Size (WASM)
+< 15 MB
+Must be downloadable in the browser instantly.
+Binary Size (Native)
+< 20 MB
+Easy to distribute via PyPI/npm without bloating apps.
+RAM Usage (Idle)
+< 50 MB
+Can run on edge devices or cheap cloud instances.
+RAM Usage (Indexing)
+< 500 MB
+Can process large documents on a standard laptop.
+Query Latency
+< 10 ms
+For up to 1,000,000 vectors on a modern CPU.
+Dependencies
+0 external
+No Docker, no Python, no C++ runtime required.
+7. Phased Rollout & Milestones
+Phase 1: The Core Engine (Pure Rust)
+Implement text parsing (Markdown, TXT, basic PDF).
+Implement sliding-window text chunker.
+Integrate ort for local ONNX embedding inference.
+Implement basic in-memory HNSW vector search.
+Implement SQLite metadata storage.
+Phase 2: The Disk-Backed Index
+Transition HNSW from in-memory to memory-mapped disk storage.
+Implement concurrent read/write locks for the index.
+Optimize chunking for semantic boundaries.
+Phase 3: The FFI & Python Wrapper
+Build tpt-rag-ffi with C ABI (opaque handles, error codes).
+Build tpt-rag-py using PyO3 and maturin.
+Set up GitHub Actions to build and publish wheels to PyPI for Win/Mac/Linux.
+Phase 4: The WebAssembly Wrapper
+Build tpt-rag-wasm using wasm-bindgen.
+Implement browser-specific storage backends (IndexedDB / Origin Private File System).
+Publish to npm.
+Phase 5: Advanced Features
+Add cross-encoder reranking.
+Add support for custom user-provided embedding models.
+Add hybrid search (Keyword/BM25 + Vector).
