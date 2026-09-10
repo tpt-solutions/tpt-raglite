@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 #[derive(Debug, thiserror::Error)]
 pub enum RagError {
     #[error("I/O error: {0}")]
@@ -11,14 +9,11 @@ pub enum RagError {
     #[error("ONNX Runtime error: {0}")]
     Onnx(String),
 
-    #[error("No text could be extracted from file: {path}")]
-    EmptyDocument { path: PathBuf },
+    #[error("No text could be extracted from file: {0}")]
+    EmptyDocument(String),
 
     #[error("Unsupported file format: {0}")]
     UnsupportedFormat(String),
-
-    #[error("Chunk index out of bounds: {index} >= {len}")]
-    ChunkIndexOutOfBounds { index: usize, len: usize },
 
     #[error("Model error: {0}")]
     Model(String),

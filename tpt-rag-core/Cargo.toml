@@ -16,9 +16,7 @@ html5ever = "0.39"
 markup5ever_rcdom = "0.39"
 tendril = "0.4"
 ort = { version = "2.0.0-rc.13", features = ["download-binaries"] }
-rayon = "1.10"
 rusqlite = { version = "0.32", features = ["bundled"] }
-memmap2 = "0.9"
 rand = "0.8"
 ordered-float = "4"
 

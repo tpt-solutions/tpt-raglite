@@ -22,6 +22,7 @@ pub struct TptRagResult {
     pub score: f32,
     pub text: *mut c_char,
     pub source: *mut c_char,
+    pub tags: *mut c_char,
 }
 
 pub struct TptRagHandle {
@@ -136,21 +137,22 @@ pub extern "C" fn tpt_rag_query(
     match handle.rag.query(query, top_k) {
         Ok(search_results) => {
             let count = search_results.len();
-            let mut boxed: Vec<TptRagResult> = search_results
+            let mut results: Vec<TptRagResult> = search_results
                 .into_iter()
                 .map(|r| {
                     let text = CString::new(r.text).unwrap_or_default();
                     let source = CString::new(r.source).unwrap_or_default();
+                    let tags = CString::new(r.tags.join(",")).unwrap_or_default();
                     TptRagResult {
                         score: r.score,
                         text: text.into_raw(),
                         source: source.into_raw(),
+                        tags: tags.into_raw(),
                     }
                 })
                 .collect();
-            boxed.shrink_to_fit();
-            let ptr = boxed.as_mut_ptr();
-            std::mem::forget(boxed);
+            let ptr = results.as_mut_ptr();
+            std::mem::forget(results);
             unsafe {
                 *results_out = ptr;
                 *count_out = count;
@@ -166,8 +168,8 @@ pub extern "C" fn tpt_rag_free_results(results: *mut TptRagResult, count: usize)
     if results.is_null() || count == 0 {
         return;
     }
-    let slice = unsafe { std::slice::from_raw_parts_mut(results, count) };
-    for r in slice.iter_mut() {
+    let mut results = unsafe { Vec::from_raw_parts(results, count, count) };
+    for r in results.iter_mut() {
         if !r.text.is_null() {
             unsafe { drop(CString::from_raw(r.text)) };
             r.text = ptr::null_mut();
@@ -176,8 +178,12 @@ pub extern "C" fn tpt_rag_free_results(results: *mut TptRagResult, count: usize)
             unsafe { drop(CString::from_raw(r.source)) };
             r.source = ptr::null_mut();
         }
+        if !r.tags.is_null() {
+            unsafe { drop(CString::from_raw(r.tags)) };
+            r.tags = ptr::null_mut();
+        }
     }
-    let _ = unsafe { Box::from_raw(std::slice::from_raw_parts_mut(results, count)) };
+    drop(results);
 }
 
 fn map_error(e: tpt_rag_core::RagError) -> TptRagError {
@@ -185,7 +191,7 @@ fn map_error(e: tpt_rag_core::RagError) -> TptRagError {
         tpt_rag_core::RagError::Io(_) => TptRagError::TptRagErrIo,
         tpt_rag_core::RagError::Sqlite(_) => TptRagError::TptRagErrSqlite,
         tpt_rag_core::RagError::Onnx(_) => TptRagError::TptRagErrOnnx,
-        tpt_rag_core::RagError::EmptyDocument { .. } => TptRagError::TptRagErrEmptyDoc,
+        tpt_rag_core::RagError::EmptyDocument(_) => TptRagError::TptRagErrEmptyDoc,
         tpt_rag_core::RagError::UnsupportedFormat(_) => TptRagError::TptRagErrUnsupported,
         _ => TptRagError::TptRagErrInternal,
     }

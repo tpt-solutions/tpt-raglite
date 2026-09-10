@@ -98,19 +98,23 @@ fn word_offset(text: &str, _words: &[&str], word_index: usize) -> usize {
     if word_index == 0 {
         return 0;
     }
-    let mut offset = 0;
     let mut word_count = 0;
+    let mut in_whitespace = false;
+
     for (i, ch) in text.char_indices() {
         if ch.is_whitespace() {
-            while text[i + 1..].chars().next().map_or(false, |c| c.is_whitespace()) {}
-            word_count += 1;
-            if word_count >= word_index {
-                return i + 1;
+            if !in_whitespace {
+                in_whitespace = true;
+                word_count += 1;
+                if word_count >= word_index {
+                    return i + 1;
+                }
             }
+        } else {
+            in_whitespace = false;
         }
-        offset = i + ch.len_utf8();
     }
-    offset
+    text.len()
 }
 
 pub struct SemanticChunker {

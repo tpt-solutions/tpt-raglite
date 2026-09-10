@@ -21,6 +21,7 @@ struct TptRagResult {
   float score;
   char *text;
   char *source;
+  char *tags;
 };
 
 extern "C" {

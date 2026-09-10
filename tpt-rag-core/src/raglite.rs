@@ -30,6 +30,8 @@ pub struct RAGLite {
     model: EmbeddingModel,
     chunker: Chunker,
     db_path: PathBuf,
+    #[cfg(feature = "reranking")]
+    reranker: Option<crate::reranker::Reranker>,
 }
 
 impl RAGLite {
@@ -55,12 +57,21 @@ impl RAGLite {
         };
         let chunker = Chunker::new(ChunkConfig::default());
 
+        #[cfg(feature = "reranking")]
+        let reranker = if model_path.exists() {
+            crate::reranker::Reranker::new(&model_path).ok()
+        } else {
+            None
+        };
+
         Ok(Self {
             index: RwLock::new(index),
             store,
             model,
             chunker,
             db_path: path.to_path_buf(),
+            #[cfg(feature = "reranking")]
+            reranker,
         })
     }
 
@@ -77,12 +88,17 @@ impl RAGLite {
         };
         let chunker = Chunker::new(ChunkConfig::default());
 
+        #[cfg(feature = "reranking")]
+        let reranker = crate::reranker::Reranker::new(model_path).ok();
+
         Ok(Self {
             index: RwLock::new(index),
             store,
             model,
             chunker,
             db_path: path.to_path_buf(),
+            #[cfg(feature = "reranking")]
+            reranker,
         })
     }
 
@@ -106,22 +122,21 @@ impl RAGLite {
 
         let text = parser.parse(path)?;
         if text.trim().is_empty() {
-            return Err(crate::error::RagError::EmptyDocument {
-                path: path.to_path_buf(),
-            });
+            return Err(crate::error::RagError::EmptyDocument(path.to_string_lossy().to_string()));
         }
 
         let chunks = self.chunker.chunk(&text);
         let source = path.to_string_lossy().to_string();
         let tag_vec: Vec<String> = tags.iter().map(|s| s.to_string()).collect();
 
+        let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+        let embeddings = self.model.embed_batch(&chunk_texts)?;
+
         let mut index = self.index.write().map_err(|e| {
             crate::error::RagError::Hnsw(format!("Lock poisoned: {}", e))
         })?;
 
-        for chunk in &chunks {
-            let embeddings = self.model.embed_batch(&[chunk.text.as_str()])?;
-            let embedding = &embeddings[0];
+        for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
             let vector_id = index.insert(embedding.clone());
 
             self.store.insert_chunk(&ChunkMetadata {
@@ -144,13 +159,14 @@ impl RAGLite {
         let chunks = self.chunker.chunk(text);
         let source = metadata.source.clone().unwrap_or_else(|| "inline".to_string());
 
+        let chunk_texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+        let embeddings = self.model.embed_batch(&chunk_texts)?;
+
         let mut index = self.index.write().map_err(|e| {
             crate::error::RagError::Hnsw(format!("Lock poisoned: {}", e))
         })?;
 
-        for chunk in &chunks {
-            let embeddings = self.model.embed_batch(&[chunk.text.as_str()])?;
-            let embedding = &embeddings[0];
+        for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
             let vector_id = index.insert(embedding.clone());
 
             self.store.insert_chunk(&ChunkMetadata {
@@ -197,8 +213,9 @@ impl RAGLite {
             return Ok(Vec::new());
         }
 
-        let model_path = find_model(&self.db_path);
-        let reranker = crate::reranker::Reranker::new(&model_path)?;
+        let reranker = self.reranker.as_ref().ok_or_else(|| {
+            crate::error::RagError::Model("Reranker not available".into())
+        })?;
 
         let chunks: Vec<String> = base_results.iter().map(|r| r.text.clone()).collect();
         let reranked = reranker.rerank(text, &chunks, rerank_top_n)?;

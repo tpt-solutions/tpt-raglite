@@ -15,7 +15,7 @@ pub struct ChunkMetadata {
 
 pub struct MetadataStore {
     conn: Connection,
-    db_path: PathBuf,
+    _db_path: PathBuf,
 }
 
 impl MetadataStore {
@@ -38,7 +38,7 @@ impl MetadataStore {
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(text, content=chunks, content_rowid=id);",
         )?;
 
-        Ok(Self { conn, db_path })
+        Ok(Self { conn, _db_path: db_path })
     }
 
     pub fn insert_chunk(&self, chunk: &ChunkMetadata) -> Result<()> {
@@ -101,6 +101,8 @@ impl MetadataStore {
     }
 
     pub fn bm25_search(&self, query: &str, top_k: usize) -> Result<Vec<(usize, f32)>> {
+        // Escape FTS5 special characters by wrapping in double quotes
+        let escaped_query = format!("\"{}\"", query.replace('"', "\"\""));
         let mut stmt = self.conn.prepare(
             "SELECT c.vector_id, bm25(chunks_fts) as rank \
              FROM chunks_fts fts \
@@ -109,7 +111,7 @@ impl MetadataStore {
              ORDER BY rank \
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![query, top_k as i64], |row| {
+        let rows = stmt.query_map(params![escaped_query, top_k as i64], |row| {
             let vector_id: usize = row.get(0)?;
             let rank: f32 = row.get(1)?;
             Ok((vector_id, rank))
@@ -126,6 +128,7 @@ impl MetadataStore {
             "DELETE FROM chunks WHERE source_path = ?1",
             params![source_path],
         )?;
+        self.conn.execute("DELETE FROM chunks_fts", [])?;
         Ok(deleted)
     }
 

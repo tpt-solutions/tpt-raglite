@@ -5,21 +5,14 @@ use crate::embedding::{cosine_similarity, EmbeddingModel};
 use crate::error::{RagError, Result};
 
 pub struct Reranker {
-    session: Mutex<ort::session::Session>,
     embedding_model: Mutex<EmbeddingModel>,
 }
 
 impl Reranker {
     pub fn new(model_path: &Path) -> Result<Self> {
-        let session = ort::session::Session::builder()
-            .map_err(|e| RagError::Onnx(e.to_string()))?
-            .commit_from_file(model_path)
-            .map_err(|e| RagError::Onnx(e.to_string()))?;
-
         let embedding_model = EmbeddingModel::new(model_path)?;
 
         Ok(Self {
-            session: Mutex::new(session),
             embedding_model: Mutex::new(embedding_model),
         })
     }

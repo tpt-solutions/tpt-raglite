@@ -140,11 +140,11 @@ impl HnswIndex {
     pub fn search(&self, query: &[f32], top_k: usize, ef_search: usize) -> Vec<(usize, f32)> {
         assert_eq!(query.len(), self.dim);
 
-        if self.entry_point.is_none() {
-            return Vec::new();
-        }
+        let entry = match self.entry_point {
+            Some(ep) => ep,
+            None => return Vec::new(),
+        };
 
-        let entry = self.entry_point.unwrap();
         let mut current_closest = entry;
 
         for layer in (1..=self.max_layer).rev() {
