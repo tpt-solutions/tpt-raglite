@@ -1,0 +1,27 @@
+[package]
+name = "tpt-rag-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+pdf-extract = "0.12"
+html5ever = "0.39"
+markup5ever_rcdom = "0.39"
+tendril = "0.4"
+ort = { version = "2.0.0-rc.13", features = ["download-binaries"] }
+rayon = "1.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
+memmap2 = "0.9"
+rand = "0.8"
+ordered-float = "4"
+
+[features]
+default = ["reranking"]
+reranking = []

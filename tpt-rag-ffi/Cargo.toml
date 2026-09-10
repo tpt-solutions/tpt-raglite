@@ -1,0 +1,18 @@
+[package]
+name = "tpt-rag-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "C ABI / FFI boundary for tpt-raglite"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+tpt-rag-core.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+cbindgen = "0.27"
