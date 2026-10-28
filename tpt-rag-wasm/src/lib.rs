@@ -56,8 +56,8 @@ impl RAGLiteWasm {
                 tags: r.tags,
             })
             .collect();
-        let json = serde_json::to_string(&js_results)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let json =
+            serde_json::to_string(&js_results).map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(JsValue::from_str(&json))
     }
 }
