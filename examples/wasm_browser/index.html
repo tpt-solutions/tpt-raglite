@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>tpt-raglite in the browser</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 0 auto;
+        max-width: 48rem;
+        padding: 1rem;
+        color: #1b1b1b;
+        background: #fff;
+      }
+      textarea { width: 100%; min-height: 10rem; box-sizing: border-box; }
+      input[type="text"] { width: 100%; box-sizing: border-box; padding: 0.4rem; }
+      button { margin: 0.4rem 0.4rem 0.4rem 0; padding: 0.4rem 0.8rem; }
+      #status { color: #555; min-height: 1.2rem; }
+      #results li { margin-bottom: 1rem; }
+      #results .meta { font-size: 0.85rem; color: #555; }
+      #results p { white-space: pre-wrap; margin: 0.3rem 0 0; }
+      @media (prefers-color-scheme: dark) {
+        body { color: #e6e6e6; background: #161616; }
+        #status, #results .meta { color: #aaa; }
+        textarea, input[type="text"] { background: #222; color: #e6e6e6; border: 1px solid #444; }
+      }
+    </style>
+  </head>
+  <body>
+    <h1>tpt-raglite in the browser</h1>
+    <p>
+      Paste notes, index them, then search. Embeddings are computed in your browser; the
+      database stays in this browser's IndexedDB.
+    </p>
+
+    <label for="kind">Format</label>
+    <select id="kind">
+      <option value="markdown">Markdown</option>
+      <option value="text">Plain text</option>
+      <option value="html">HTML</option>
+    </select>
+    <textarea id="content" placeholder="Paste a document here"></textarea>
+    <div>
+      <button id="index" type="button">Index</button>
+    </div>
+
+    <label for="question">Question or keywords</label>
+    <input id="question" type="text" />
+    <div>
+      <button id="search" type="button">Search by meaning</button>
+      <button id="keyword" type="button">Search by keywords</button>
+    </div>
+
+    <p id="status"></p>
+    <ol id="results"></ol>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
