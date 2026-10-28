@@ -42,10 +42,72 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
-    name: Tests
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The integration tests use the real model. Without it they print a notice and pass.
+      - name: Fetch models
+        shell: bash
+        run: bash scripts/fetch_model.sh
+      - name: Run tests
+        run: cargo test --workspace
+
+  ffi:
+    name: C ABI (header in sync, C tests)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --lib --workspace
+      - name: Install cbindgen
+        run: cargo install cbindgen --version 0.27.0 --locked
+      - name: Regenerate header
+        run: cbindgen --config tpt-rag-ffi/cbindgen.toml --crate tpt-rag-ffi --output tpt_raglite.h
+      - name: Fail if the committed header is stale
+        run: git diff --exit-code -- tpt_raglite.h
+      - name: Fetch models
+        run: bash scripts/fetch_model.sh
+      - name: Compile and run the C integration test and example
+        run: bash tpt-rag-ffi/tests/run_c_integration.sh
+
+  python:
+    name: Python wheel and tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch models
+        shell: bash
+        run: bash scripts/fetch_model.sh
+      - name: Build wheel
+        working-directory: tpt-rag-py
+        run: |
+          pip install maturin pytest
+          maturin build --release --out dist
+      - name: Install wheel and run Python tests
+        shell: bash
+        run: |
+          pip install tpt-rag-py/dist/*.whl
+          pytest -q tpt-rag-py/tests
+      - name: Run the Python example
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cd "$(mktemp -d)"
+          RAGLITE_MODEL="$GITHUB_WORKSPACE/models/all-MiniLM-L6-v2.onnx" \
+            python "$GITHUB_WORKSPACE/examples/python_quickstart.py"

@@ -1,7 +1,8 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is committed: the repository ships binaries (FFI, Python) and CI should build
+# the exact dependency versions, including the ort release candidate.
 
 # Python
 __pycache__/
@@ -35,18 +36,23 @@ Thumbs.db
 *.swp
 *.swo
 
-# ONNX models (large binary files — download separately)
+# Model files (large binaries and vocabulary) — download with scripts/fetch_model.sh
 models/*.onnx
 models/*.bin
+models/vocab.txt
 
-# Test databases
+# Test databases and example output
 *.sqlite3
 *.sqlite3-shm
 *.sqlite3-wal
+hnsw.bin
 test_db/
 my_app_db/
 my_c_db/
 my_browser_db/
+quickstart_db/
+quickstart_notes.md
+pdf_qa_db/
 
 # Benchmark output
 criterion/
