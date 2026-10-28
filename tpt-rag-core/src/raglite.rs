@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
@@ -6,13 +6,14 @@ use std::sync::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::chunker::{Chunk, Chunker};
+use crate::chunker::{chunk_document, Chunk, Chunker};
 use crate::config::RagConfig;
 use crate::embedding::EmbeddingModel;
 use crate::error::{RagError, Result};
-use crate::hnsw::HnswIndex;
-use crate::metadata::{ChunkMetadata, MetadataStore, META_INDEX_EPOCH};
-use crate::parser::{Parser, ParserRegistry};
+use crate::eval::{lexical_query, EvalCase};
+use crate::hnsw::{content_hash, HnswIndex};
+use crate::metadata::{ChunkMetadata, MetadataStore, META_INDEX_EPOCH, META_SCHEMA_VERSION};
+use crate::parser::{Document, Parser, ParserRegistry};
 #[cfg(feature = "reranking")]
 use crate::reranker::Reranker;
 
@@ -23,11 +24,12 @@ const REBUILD_BATCH: usize = 256;
 const INDEX_FILE: &str = "hnsw.bin";
 const META_MODEL: &str = "model";
 const META_DIMENSIONS: &str = "dimensions";
-const META_SCHEMA_VERSION: &str = "schema_version";
 
 /// Version of the SQLite layout this library writes. A database with a higher version was
 /// written by a newer library and is refused, because this library cannot read it safely.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Version 2 added the chunk offsets, version 3 the section, and version 4 the `documents`
+/// table of content hashes. Opening an older database runs the missing migrations.
+pub const SCHEMA_VERSION: u32 = crate::metadata::LATEST_SCHEMA_VERSION;
 
 /// Restricts a query to chunks that match every condition set here.
 #[derive(Debug, Clone, Default)]
@@ -41,6 +43,7 @@ pub struct QueryFilter {
 }
 
 impl QueryFilter {
+    /// Returns true when a result passes every condition in this filter.
     pub fn matches(&self, result: &SearchResult) -> bool {
         self.tags.iter().all(|t| result.tags.contains(t))
             && self
@@ -56,14 +59,20 @@ impl QueryFilter {
 /// One line of the report from [`RAGLite::check`].
 #[derive(Debug, Clone)]
 pub struct Check {
+    /// Short name of the check, such as `index`.
     pub name: &'static str,
+    /// Whether the check passed.
     pub ok: bool,
+    /// What was checked, or what went wrong.
     pub detail: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Options for [`RAGLite::add_text`].
 pub struct Metadata {
+    /// Source label for the text. When unset, the text is stored as `inline`.
     pub source: Option<String>,
+    /// Tags applied to every chunk of the text.
     pub tags: Vec<String>,
 }
 
@@ -74,15 +83,29 @@ pub struct Metadata {
 /// - [`RAGLite::query_reranked`]: cross-encoder relevance, from 0 to 1.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
+    /// Relevance score. See the type documentation for the scale of each query method.
     pub score: f32,
+    /// The chunk text.
     pub text: String,
+    /// Source path of the document the chunk came from.
     pub source: String,
+    /// Tags attached to the chunk.
     pub tags: Vec<String>,
     /// Row id of the chunk in the metadata store. Stable until the document is re-ingested
     /// or the index is rebuilt, so it can be cited within one database.
     pub chunk_id: u64,
     /// When the chunk was ingested, in seconds since the Unix epoch.
     pub created_at: u64,
+    /// Byte offset where the chunk starts in the text the parser returned for its document
+    /// (for plain text and `add_text`, the text itself). `None` for chunks stored before
+    /// schema version 2.
+    pub start_offset: Option<u64>,
+    /// Byte offset just past the end of the chunk, in the same text as `start_offset`.
+    pub end_offset: Option<u64>,
+    /// Heading path of the section the chunk starts in, such as `Setup > Backups`. Set for
+    /// Markdown; `None` for other formats, for documents without headings, and for chunks
+    /// stored before schema version 3.
+    pub section: Option<String>,
 }
 
 /// Snapshot of what a database contains.
@@ -104,6 +127,19 @@ pub struct IngestReport {
     /// Files that were ingested.
     pub added: Vec<PathBuf>,
     /// Files that could not be ingested, with the reason. Other files are still ingested.
+    pub failed: Vec<(PathBuf, String)>,
+}
+
+/// Outcome of [`RAGLite::sync_directory`].
+#[derive(Debug, Clone, Default)]
+pub struct SyncReport {
+    /// Files that were new or had changed, and were ingested.
+    pub indexed: Vec<PathBuf>,
+    /// Files whose contents had not changed since the last sync.
+    pub unchanged: usize,
+    /// Sources removed because their file is no longer in the folder.
+    pub removed: Vec<String>,
+    /// Files that could not be ingested, with the reason. Other files are still synced.
     pub failed: Vec<(PathBuf, String)>,
 }
 
@@ -181,17 +217,8 @@ impl RAGLite {
         };
         let dimensions = model.dimensions;
 
+        // Opening migrates the database to the latest schema, or refuses a newer one.
         let store = MetadataStore::open(path)?;
-        if let Some(stored) = store.get_meta(META_SCHEMA_VERSION)? {
-            let stored: u32 = stored.parse().unwrap_or(u32::MAX);
-            if stored > SCHEMA_VERSION {
-                return Err(RagError::SchemaTooNew {
-                    stored,
-                    supported: SCHEMA_VERSION,
-                });
-            }
-        }
-        store.set_meta(META_SCHEMA_VERSION, &SCHEMA_VERSION.to_string())?;
         let model_changed = check_model_identity(&store, &model_name, dimensions)?;
         if model_changed && !config.reembed_on_model_change {
             return Err(RagError::Model(format!(
@@ -331,6 +358,7 @@ impl RAGLite {
         Ok(count)
     }
 
+    /// Returns counts and sizes for the database.
     pub fn stats(&self) -> Result<Stats> {
         let index_bytes = std::fs::metadata(self.db_path.join(INDEX_FILE))
             .map(|m| m.len())
@@ -343,6 +371,7 @@ impl RAGLite {
         })
     }
 
+    /// Ingests a file. It is parsed, chunked and embedded. Adding a file again replaces its earlier chunks.
     pub fn add_document(&self, path: &Path, tags: &[&str]) -> Result<()> {
         let parser = self.parsers.for_path(path).ok_or_else(|| {
             RagError::UnsupportedFormat(
@@ -353,16 +382,21 @@ impl RAGLite {
             )
         })?;
 
-        let text = parser.parse(path)?;
-        if text.trim().is_empty() {
+        let document: Document = parser.parse_document(path)?;
+        if document.text.trim().is_empty() {
             return Err(RagError::EmptyDocument(path.to_string_lossy().to_string()));
         }
 
-        let chunks = self.chunker.chunk(&text);
+        let chunks = chunk_document(&self.chunker, &document);
+        let sections: Vec<Option<String>> = chunks
+            .iter()
+            .map(|c| document.section_at(c.start_offset))
+            .collect();
         let source = path.to_string_lossy().to_string();
         let tag_vec: Vec<String> = tags.iter().map(|s| s.to_string()).collect();
         // Re-adding a file replaces its earlier chunks rather than duplicating them.
-        self.ingest(&chunks, &source, &tag_vec, true)
+        self.ingest(&chunks, &sections, &source, &tag_vec, true)?;
+        self.store.forget_document_hash(&source)
     }
 
     /// Ingests every supported file under `dir`, recursively, in path order. A file that
@@ -398,6 +432,52 @@ impl RAGLite {
         Ok(self.ingest_files(files, tags, on_progress))
     }
 
+    /// Brings the database in line with a folder. New files and files whose contents changed
+    /// are ingested, unchanged files are skipped, and files that are gone from the folder are
+    /// removed. Only files that a sync has ingested are tracked for removal, so keep a folder
+    /// in sync from the start. A file added with `add_document` is ingested again by the next
+    /// sync, because its stored hash is cleared.
+    pub fn sync_directory(&self, dir: &Path, tags: &[&str]) -> Result<SyncReport> {
+        let mut files = Vec::new();
+        collect_files(dir, &self.parsers, &mut files)?;
+        files.sort();
+
+        let mut report = SyncReport::default();
+        let mut present = HashSet::new();
+        for file in files {
+            let source = file.to_string_lossy().to_string();
+            present.insert(source.clone());
+            let bytes = match std::fs::read(&file) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    report.failed.push((file, e.to_string()));
+                    continue;
+                }
+            };
+            let hash = content_hash(&bytes);
+            if self.store.document_hash(&source)?.as_deref() == Some(hash.as_str()) {
+                report.unchanged += 1;
+                continue;
+            }
+            match self.add_document(&file, tags) {
+                Ok(()) => {
+                    self.store.set_document_hash(&source, &hash)?;
+                    report.indexed.push(file);
+                }
+                Err(e) => report.failed.push((file, e.to_string())),
+            }
+        }
+
+        for source in self.store.document_sources()? {
+            if Path::new(&source).starts_with(dir) && !present.contains(&source) {
+                self.delete_document(&source)?;
+                report.removed.push(source);
+            }
+        }
+        self.flush()?;
+        Ok(report)
+    }
+
     /// Ingests the files in path order. A file that fails is recorded and skipped.
     fn ingest_files(
         &self,
@@ -418,17 +498,19 @@ impl RAGLite {
         report
     }
 
+    /// Ingests a string. Blank text is ignored. Adding the same source again replaces its earlier chunks.
     pub fn add_text(&self, text: &str, metadata: &Metadata) -> Result<()> {
         if text.trim().is_empty() {
             return Ok(());
         }
 
         let chunks = self.chunker.chunk(text);
+        let sections = vec![None; chunks.len()];
         let source = metadata
             .source
             .clone()
             .unwrap_or_else(|| "inline".to_string());
-        self.ingest(&chunks, &source, &metadata.tags, false)
+        self.ingest(&chunks, &sections, &source, &metadata.tags, false)
     }
 
     /// Removes every chunk ingested from `source`. Their vectors are hidden from search
@@ -456,7 +538,16 @@ impl RAGLite {
     /// leaves no trace. With `replace`, the earlier chunks of `source` are removed in the same
     /// transaction. If the metadata write fails, the new vectors are hidden again, so index
     /// and metadata stay consistent.
-    fn ingest(&self, chunks: &[Chunk], source: &str, tags: &[String], replace: bool) -> Result<()> {
+    /// Stores `chunks` for `source`. `sections` holds the section of each chunk, in the same
+    /// order as `chunks`.
+    fn ingest(
+        &self,
+        chunks: &[Chunk],
+        sections: &[Option<String>],
+        source: &str,
+        tags: &[String],
+        replace: bool,
+    ) -> Result<()> {
         if chunks.is_empty() {
             return Ok(());
         }
@@ -493,12 +584,16 @@ impl RAGLite {
         let rows: Vec<ChunkMetadata> = chunks
             .iter()
             .zip(&new_ids)
-            .map(|(chunk, &vector_id)| ChunkMetadata {
+            .zip(sections)
+            .map(|((chunk, &vector_id), section)| ChunkMetadata {
                 vector_id,
                 text: chunk.text.clone(),
                 source_path: source.to_string(),
                 created_at: created_at.clone(),
                 tags: tags.to_vec(),
+                start_offset: Some(chunk.start_offset as u64),
+                end_offset: Some(chunk.end_offset as u64),
+                section: section.clone(),
             })
             .collect();
 
@@ -584,6 +679,37 @@ impl RAGLite {
         Ok(results)
     }
 
+    /// Returns `top_k` chunks that are relevant to the query but not near-duplicates of each
+    /// other (maximal marginal relevance). `relevance_weight` is 1.0 for plain relevance order
+    /// and 0.0 for the most varied results. The score is still the query similarity. The
+    /// search looks at the best `4 * top_k` vector matches (at least 20).
+    pub fn query_diverse(
+        &self,
+        text: &str,
+        top_k: usize,
+        relevance_weight: f32,
+    ) -> Result<Vec<SearchResult>> {
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let candidate_k = top_k.saturating_mul(4).max(20);
+        let query_embedding = self.model.embed(text)?;
+
+        let index = self
+            .index
+            .read()
+            .map_err(|e| RagError::Hnsw(format!("Lock poisoned: {}", e)))?;
+        let candidates = index.search(
+            &query_embedding,
+            candidate_k,
+            self.config.ef_search.max(candidate_k),
+        )?;
+        let picked = index.diversify(&candidates, top_k, relevance_weight);
+        drop(index);
+
+        self.resolve(picked)
+    }
+
     /// Checks the database and reports each result. Each check is `ok` or not, with a
     /// detail line. Nothing is changed. The CLI's `doctor` command prints this.
     pub fn check(&self) -> Result<Vec<Check>> {
@@ -605,10 +731,7 @@ impl RAGLite {
             Check {
                 name: "embedding model",
                 ok: true,
-                detail: format!(
-                    "{} ({} dimensions)",
-                    self.model_name, self.model.dimensions
-                ),
+                detail: format!("{} ({} dimensions)", self.model_name, self.model.dimensions),
             },
             Check {
                 name: "model identity",
@@ -726,28 +849,56 @@ impl RAGLite {
         self.resolve(scored)
     }
 
+    /// Labelled queries made from the database's own chunks, at most `per_source` for each
+    /// source. See [`lexical_query`](crate::eval::lexical_query) for how each query is made.
+    pub fn eval_cases(&self, per_source: usize) -> Result<Vec<EvalCase>> {
+        let mut taken: HashMap<String, usize> = HashMap::new();
+        let mut cases = Vec::new();
+        for (_, chunk) in self.store.all_chunks()? {
+            let count = taken.entry(chunk.source_path.clone()).or_insert(0);
+            if *count >= per_source {
+                continue;
+            }
+            if let Some(query) = lexical_query(&chunk.text) {
+                *count += 1;
+                cases.push(EvalCase {
+                    query,
+                    expected_source: chunk.source_path,
+                });
+            }
+        }
+        Ok(cases)
+    }
+
+    /// The chunks just before and after `chunk_id` in the same document, at most `radius` on
+    /// each side, in document order. The chunk itself is not included, so the caller keeps
+    /// the score of the hit. Neighbours are not scored, so their `score` is 0.0. Chunks
+    /// stored before schema version 2 have no order and return no neighbours.
+    pub fn neighbors(&self, chunk_id: u64, radius: usize) -> Result<Vec<SearchResult>> {
+        let rows = self.store.get_neighbors(chunk_id as i64, radius)?;
+        Ok(rows
+            .into_iter()
+            .map(|(row_id, meta)| to_search_result(0.0, row_id, meta))
+            .collect())
+    }
+
     /// Turns `(vector id, score)` pairs into search results, skipping ids with no metadata.
     fn resolve(&self, scored: Vec<(usize, f32)>) -> Result<Vec<SearchResult>> {
         let mut results = Vec::with_capacity(scored.len());
         for (vector_id, score) in scored {
             if let Some((row_id, meta)) = self.store.get_chunk_row_by_vector_id(vector_id)? {
-                results.push(SearchResult {
-                    score,
-                    text: meta.text,
-                    source: meta.source_path,
-                    tags: meta.tags,
-                    chunk_id: row_id.max(0) as u64,
-                    created_at: meta.created_at.parse().unwrap_or(0),
-                });
+                results.push(to_search_result(score, row_id, meta));
             }
         }
         Ok(results)
     }
 
+    /// Number of chunks in the metadata store.
     pub fn chunk_count(&self) -> Result<usize> {
         self.store.count()
     }
 
+    /// Number of vectors in the index.
     pub fn vector_count(&self) -> usize {
         self.index.read().map(|i| i.len()).unwrap_or(0)
     }
@@ -862,6 +1013,20 @@ fn find_reranker(db_path: &Path, config: &RagConfig) -> Option<PathBuf> {
     .find(|p| p.exists())
 }
 
+fn to_search_result(score: f32, row_id: i64, meta: ChunkMetadata) -> SearchResult {
+    SearchResult {
+        score,
+        text: meta.text,
+        source: meta.source_path,
+        tags: meta.tags,
+        chunk_id: row_id.max(0) as u64,
+        created_at: meta.created_at.parse().unwrap_or(0),
+        start_offset: meta.start_offset,
+        end_offset: meta.end_offset,
+        section: meta.section,
+    }
+}
+
 fn chrono_now() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -890,6 +1055,9 @@ mod tests {
             tags: vec!["tag".to_string()],
             chunk_id: 1,
             created_at: 0,
+            start_offset: None,
+            end_offset: None,
+            section: None,
         };
         assert_eq!(r.score, 0.95);
         assert_eq!(r.text, "hello");

@@ -442,7 +442,9 @@ fn glob_ingestion_takes_only_matching_supported_files() {
     let rag = open(&dir.path().join("db"), &model);
     // Glob patterns use forward slashes on every platform.
     let pattern = format!("{}/notes/**/*", dir.path().display()).replace('\\', "/");
-    let report = rag.add_glob(&pattern, &["notes"], &mut |_, _, _| {}).unwrap();
+    let report = rag
+        .add_glob(&pattern, &["notes"], &mut |_, _, _| {})
+        .unwrap();
 
     assert_eq!(report.added.len(), 2, "added: {:?}", report.added);
     assert!(report.failed.is_empty());
@@ -475,6 +477,7 @@ fn filtered_query_keeps_only_matching_tags_and_sources() {
     let by_tag = QueryFilter {
         tags: vec!["science".into()],
         source_prefix: None,
+        created_since: None,
     };
     let hits = rag.query_filtered("Jupiter", 5, &by_tag).unwrap();
     assert_eq!(hits.len(), 1);
@@ -483,6 +486,7 @@ fn filtered_query_keeps_only_matching_tags_and_sources() {
     let by_prefix = QueryFilter {
         tags: vec![],
         source_prefix: Some("notes/".into()),
+        created_since: None,
     };
     let hits = rag.query_filtered("Jupiter", 5, &by_prefix).unwrap();
     assert_eq!(hits.len(), 1);
@@ -491,6 +495,7 @@ fn filtered_query_keeps_only_matching_tags_and_sources() {
     let none = QueryFilter {
         tags: vec!["science".into(), "personal".into()],
         source_prefix: None,
+        created_since: None,
     };
     assert!(rag.query_filtered("Jupiter", 5, &none).unwrap().is_empty());
 }
@@ -546,6 +551,8 @@ fn pdf_with_a_text_layer_is_searchable() {
         .query("which planet is known as the red planet", 1)
         .unwrap();
     assert!(results[0].source.ends_with("sample.pdf"));
+    // The fixture has one page, so its chunks report page 1.
+    assert_eq!(results[0].section.as_deref(), Some("page 1"));
     assert!(results[0].text.contains("Mars"), "{}", results[0].text);
 }
 
@@ -594,4 +601,238 @@ fn invalid_config_is_rejected_before_loading_anything() {
         RAGLite::open_with_config(&dir.path().join("db"), config),
         Err(RagError::InvalidConfig(_))
     ));
+}
+
+#[test]
+fn diverse_query_avoids_near_duplicates() {
+    let model = require_model!();
+    let dir = tempfile::tempdir().unwrap();
+    let rag = open(&dir.path().join("db"), &model);
+    let texts = [
+        ("a", "Jupiter is the largest planet in the solar system."),
+        ("b", "Jupiter is the largest planet in our solar system."),
+        ("c", "Bananas are a good source of potassium."),
+    ];
+    for (source, text) in texts {
+        rag.add_text(
+            text,
+            &Metadata {
+                source: Some(source.into()),
+                tags: vec![],
+            },
+        )
+        .unwrap();
+    }
+    let question = "largest planet in the solar system";
+
+    // Weight 1.0 is plain relevance order, so it matches the ordinary query.
+    let plain: Vec<u64> = rag
+        .query(question, 2)
+        .unwrap()
+        .iter()
+        .map(|r| r.chunk_id)
+        .collect();
+    let relevant: Vec<u64> = rag
+        .query_diverse(question, 2, 1.0)
+        .unwrap()
+        .iter()
+        .map(|r| r.chunk_id)
+        .collect();
+    assert_eq!(relevant, plain);
+
+    // Weight 0.0 keeps one Jupiter sentence and then the unrelated one.
+    let varied = rag.query_diverse(question, 2, 0.0).unwrap();
+    assert_eq!(varied.len(), 2);
+    assert!(
+        varied[1].text.contains("Bananas"),
+        "got {:?}",
+        varied[1].text
+    );
+}
+
+#[test]
+fn offsets_locate_each_result_in_the_ingested_text() {
+    let model = require_model!();
+    let dir = tempfile::tempdir().unwrap();
+    let rag = open(&dir.path().join("db"), &model);
+    let text = vec!["Backups run every night at two in the morning."; 150].join(" ");
+    rag.add_text(
+        &text,
+        &Metadata {
+            source: Some("long".into()),
+            tags: vec![],
+        },
+    )
+    .unwrap();
+
+    let hits = rag.query("when do backups run", 10).unwrap();
+    assert!(!hits.is_empty());
+    for hit in &hits {
+        let start = hit.start_offset.expect("start offset") as usize;
+        let end = hit.end_offset.expect("end offset") as usize;
+        assert_eq!(&text[start..end], hit.text);
+    }
+}
+
+#[test]
+fn neighbors_surround_a_hit_in_document_order() {
+    let model = require_model!();
+    let dir = tempfile::tempdir().unwrap();
+    let rag = open(&dir.path().join("db"), &model);
+    let text = vec!["Backups run every night at two in the morning."; 150].join(" ");
+    rag.add_text(
+        &text,
+        &Metadata {
+            source: Some("long".into()),
+            tags: vec![],
+        },
+    )
+    .unwrap();
+
+    let hit = rag.query("when do backups run", 1).unwrap().remove(0);
+    let around = rag.neighbors(hit.chunk_id, 1).unwrap();
+    assert!(
+        !around.is_empty() && around.len() <= 2,
+        "got {} neighbours",
+        around.len()
+    );
+    for n in &around {
+        let start = n.start_offset.expect("start offset") as usize;
+        let end = n.end_offset.expect("end offset") as usize;
+        assert_eq!(&text[start..end], n.text);
+        assert_eq!(n.score, 0.0);
+        assert_ne!(n.chunk_id, hit.chunk_id);
+    }
+    assert!(around
+        .windows(2)
+        .all(|w| w[0].start_offset < w[1].start_offset));
+}
+
+#[test]
+fn markdown_results_report_their_section() {
+    let model = require_model!();
+    let dir = tempfile::tempdir().unwrap();
+    let rag = open(&dir.path().join("db"), &model);
+    let doc = format!(
+        "# Setup\n\n{}\n\n# Lounge\n\n{}",
+        "Backups run every night at two in the morning. ".repeat(60),
+        "Tea is served warm in the lounge every afternoon. ".repeat(60),
+    );
+    let guide = write_file(dir.path(), "guide.md", &doc);
+    rag.add_document(&guide, &[]).unwrap();
+
+    let backups = rag.query("when do backups run", 1).unwrap().remove(0);
+    assert_eq!(backups.section.as_deref(), Some("Setup"));
+    let tea = rag.query("where is tea served", 1).unwrap().remove(0);
+    assert_eq!(tea.section.as_deref(), Some("Lounge"));
+    // No chunk spans the boundary between the two sections.
+    for hit in rag.query("backups tea lounge", 10).unwrap() {
+        assert!(
+            !(hit.text.contains("Backups") && hit.text.contains("Tea")),
+            "{}",
+            hit.text
+        );
+    }
+}
+
+#[test]
+fn plain_text_results_have_no_section() {
+    let model = require_model!();
+    let dir = tempfile::tempdir().unwrap();
+    let rag = open(&dir.path().join("db"), &model);
+    rag.add_text(
+        "Jupiter is a gas giant.",
+        &Metadata {
+            source: Some("notes".into()),
+            tags: vec![],
+        },
+    )
+    .unwrap();
+    assert_eq!(rag.query("gas giant", 1).unwrap()[0].section, None);
+}
+
+#[test]
+fn sync_indexes_changes_and_removes_deleted_files() {
+    let model = require_model!();
+    let dir = tempfile::tempdir().unwrap();
+    let notes = dir.path().join("notes");
+    std::fs::create_dir(&notes).unwrap();
+    let rag = open(&dir.path().join("db"), &model);
+    write_file(&notes, "space.txt", SPACE);
+    write_file(&notes, "garden.txt", GARDEN);
+
+    let first = rag.sync_directory(&notes, &[]).unwrap();
+    assert_eq!(first.indexed.len(), 2);
+    assert!(first.failed.is_empty());
+
+    let again = rag.sync_directory(&notes, &[]).unwrap();
+    assert!(again.indexed.is_empty());
+    assert_eq!(again.unchanged, 2);
+
+    write_file(&notes, "space.txt", COOKING);
+    let changed = rag.sync_directory(&notes, &[]).unwrap();
+    assert_eq!(changed.indexed.len(), 1);
+    assert_eq!(changed.unchanged, 1);
+    assert!(rag.query("sourdough bread", 1).unwrap()[0]
+        .text
+        .contains("sourdough"));
+
+    std::fs::remove_file(notes.join("garden.txt")).unwrap();
+    let removed = rag.sync_directory(&notes, &[]).unwrap();
+    assert_eq!(removed.removed.len(), 1);
+    assert!(removed.removed[0].ends_with("garden.txt"));
+    assert!(rag
+        .query("tomato plants", 5)
+        .unwrap()
+        .iter()
+        .all(|r| !r.source.ends_with("garden.txt")));
+
+    // A removed file that comes back is indexed again.
+    write_file(&notes, "garden.txt", GARDEN);
+    let back = rag.sync_directory(&notes, &[]).unwrap();
+    assert_eq!(back.indexed.len(), 1);
+}
+
+#[test]
+fn sync_ingests_a_file_again_after_add_document() {
+    let model = require_model!();
+    let dir = tempfile::tempdir().unwrap();
+    let notes = dir.path().join("notes");
+    std::fs::create_dir(&notes).unwrap();
+    let rag = open(&dir.path().join("db"), &model);
+    let space = write_file(&notes, "space.txt", SPACE);
+
+    assert_eq!(rag.sync_directory(&notes, &[]).unwrap().indexed.len(), 1);
+    // Re-adding by hand replaces the chunks, so the next sync must not skip the file.
+    rag.add_document(&space, &[]).unwrap();
+    assert_eq!(rag.sync_directory(&notes, &[]).unwrap().indexed.len(), 1);
+}
+
+#[test]
+fn generated_cases_find_their_own_source() {
+    let model = require_model!();
+    let dir = tempfile::tempdir().unwrap();
+    let rag = open(&dir.path().join("db"), &model);
+    for (source, text) in [("space", SPACE), ("cooking", COOKING), ("garden", GARDEN)] {
+        rag.add_text(
+            text,
+            &Metadata {
+                source: Some(source.into()),
+                tags: vec![],
+            },
+        )
+        .unwrap();
+    }
+
+    let cases = rag.eval_cases(1).unwrap();
+    assert_eq!(cases.len(), 3);
+    for case in &cases {
+        let found = rag.query(&case.query, 3).unwrap();
+        assert!(
+            found.iter().any(|r| r.source == case.expected_source),
+            "{:?} did not find {}",
+            case.query,
+            case.expected_source
+        );
+    }
 }

@@ -1,11 +1,16 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{RagError, Result};
+use crate::parser::Document;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Sizes, in words, used to split a document into chunks.
 pub struct ChunkConfig {
+    /// Chunk length in words.
     pub window_size: usize,
+    /// Words shared by consecutive chunks. Must be less than `window_size`.
     pub overlap: usize,
+    /// A sentence boundary only ends a chunk once the chunk has at least this many words.
     pub min_chunk_size: usize,
 }
 
@@ -20,17 +25,23 @@ impl Default for ChunkConfig {
 }
 
 #[derive(Debug, Clone)]
+/// A piece of a document, with its position in the source text.
 pub struct Chunk {
+    /// The chunk text.
     pub text: String,
+    /// Byte offset where the chunk starts in the source text.
     pub start_offset: usize,
+    /// Byte offset just past the end of the chunk in the source text.
     pub end_offset: usize,
 }
 
+/// Splits text into overlapping windows of words, preferring sentence boundaries.
 pub struct Chunker {
     config: ChunkConfig,
 }
 
 impl Chunker {
+    /// Creates a chunker. Fails if `overlap` is not less than `window_size`.
     pub fn new(config: ChunkConfig) -> Result<Self> {
         if config.window_size == 0 {
             return Err(RagError::InvalidConfig(
@@ -160,11 +171,13 @@ fn is_abbreviation(core: &str) -> bool {
     core.chars().count() == 1 && core.chars().all(char::is_alphabetic)
 }
 
+/// Splits text on sentence boundaries, merging sentences until each chunk is large enough.
 pub struct SemanticChunker {
     min_chunk_size: usize,
 }
 
 impl SemanticChunker {
+    /// Creates a chunker that merges sentences until chunks reach `min_chunk_size` words.
     pub fn new(min_chunk_size: usize) -> Self {
         Self { min_chunk_size }
     }
@@ -260,6 +273,35 @@ fn push_sentence(text: &str, start: usize, end: usize, out: &mut Vec<Sentence>) 
             end_offset: start_offset + trimmed.len(),
         });
     }
+}
+
+/// Splits a document into chunks so that no chunk crosses a heading, a PDF page, or a boundary
+/// such as a code block edge. Each section, the text between two of these, is chunked on its
+/// own. The offsets are moved back into the whole document, so `text[start..end]` still gives
+/// each chunk.
+pub fn chunk_document(chunker: &Chunker, document: &Document) -> Vec<Chunk> {
+    let mut starts: Vec<usize> = std::iter::once(0)
+        .chain(document.headings.iter().map(|h| h.offset))
+        .chain(document.boundaries.iter().copied())
+        .collect();
+    starts.sort_unstable();
+    starts.dedup();
+
+    let mut chunks = Vec::new();
+    for (i, &start) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(document.text.len());
+        for chunk in chunker.chunk(&document.text[start..end]) {
+            if chunk.text.trim().is_empty() {
+                continue;
+            }
+            chunks.push(Chunk {
+                text: chunk.text,
+                start_offset: start + chunk.start_offset,
+                end_offset: start + chunk.end_offset,
+            });
+        }
+    }
+    chunks
 }
 
 #[cfg(test)]
@@ -423,5 +465,80 @@ mod tests {
         let chunker = SemanticChunker::new(5);
         let chunks = chunker.chunk("");
         assert!(chunks.is_empty());
+    }
+
+    use crate::parser::{Document, Heading};
+
+    #[test]
+    fn chunks_never_cross_a_section_boundary() {
+        let config = crate::chunker::ChunkConfig {
+            window_size: 8,
+            overlap: 2,
+            min_chunk_size: 3,
+        };
+        let chunker = Chunker::new(config).unwrap();
+        let first = "Alpha one two three four five six seven eight nine ten. ";
+        let second = "Beta eleven twelve thirteen fourteen fifteen sixteen seventeen. ";
+        let text = format!("{first}{second}");
+        let document = Document {
+            text: text.clone(),
+            headings: vec![
+                Heading {
+                    offset: 0,
+                    path: "First".to_string(),
+                },
+                Heading {
+                    offset: first.len(),
+                    path: "Second".to_string(),
+                },
+            ],
+            boundaries: Vec::new(),
+        };
+
+        let chunks = chunk_document(&chunker, &document);
+        assert!(chunks.iter().any(|c| c.start_offset < first.len()));
+        assert!(chunks.iter().any(|c| c.start_offset >= first.len()));
+        for c in &chunks {
+            assert_eq!(&text[c.start_offset..c.end_offset], c.text);
+            let starts_in_first = c.start_offset < first.len();
+            let ends_in_first = c.end_offset <= first.len();
+            assert_eq!(
+                starts_in_first, ends_in_first,
+                "chunk crosses: {:?}",
+                c.text
+            );
+        }
+    }
+
+    #[test]
+    fn chunks_do_not_cross_code_block_boundaries() {
+        let config = crate::chunker::ChunkConfig {
+            window_size: 8,
+            overlap: 2,
+            min_chunk_size: 3,
+        };
+        let chunker = Chunker::new(config).unwrap();
+        let prose = "Run the backup script every night so the data stays safe. ";
+        let code = "backup --all --to /mnt/drive --verify --keep-days thirty ";
+        let text = format!("{prose}{code}");
+        let document = Document {
+            text: text.clone(),
+            boundaries: vec![prose.len(), text.len()],
+            ..Document::default()
+        };
+
+        let chunks = chunk_document(&chunker, &document);
+        assert!(chunks.iter().any(|c| c.start_offset < prose.len()));
+        assert!(chunks.iter().any(|c| c.start_offset >= prose.len()));
+        for c in &chunks {
+            assert_eq!(&text[c.start_offset..c.end_offset], c.text);
+            let starts_in_prose = c.start_offset < prose.len();
+            let ends_in_prose = c.end_offset <= prose.len();
+            assert_eq!(
+                starts_in_prose, ends_in_prose,
+                "chunk crosses: {:?}",
+                c.text
+            );
+        }
     }
 }

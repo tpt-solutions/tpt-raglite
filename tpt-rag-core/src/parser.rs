@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use pulldown_cmark::{Event, Parser as CmarkParser, TagEnd};
+use pulldown_cmark::{Event, HeadingLevel, Parser as CmarkParser, Tag, TagEnd};
 
 use crate::error::{RagError, Result};
 
@@ -9,11 +9,55 @@ pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 
+/// A parsed document: its text, and the headings in it, for formats that have them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Document {
+    /// The text. Chunk offsets and heading offsets refer to this text.
+    pub text: String,
+    /// Headings in document order.
+    pub headings: Vec<Heading>,
+    /// Offsets where a chunk must not cross, such as the edges of a Markdown code block.
+    /// Headings are boundaries too, without being listed here.
+    pub boundaries: Vec<usize>,
+}
+
+/// A heading in a parsed document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Heading {
+    /// Byte offset in [`Document::text`] where the heading starts.
+    pub offset: usize,
+    /// The heading path from the top level down, such as `Setup > Backups`.
+    pub path: String,
+}
+
+impl Document {
+    /// The heading path in effect at a byte offset: the last heading that starts at or before
+    /// it. `None` before the first heading, or when the document has no headings.
+    pub fn section_at(&self, offset: usize) -> Option<String> {
+        let count = self.headings.partition_point(|h| h.offset <= offset);
+        count
+            .checked_sub(1)
+            .map(|index| self.headings[index].path.clone())
+    }
+}
+
+/// Turns a file into text. Implement this to add support for a format.
 pub trait Parser: Send + Sync {
+    /// Returns the document's text. Fails if the file cannot be read or decoded.
     fn parse(&self, path: &Path) -> Result<String>;
+    /// Returns the text and its headings. The default has no headings; a parser with a heading
+    /// structure overrides this so chunks can record the section they belong to.
+    fn parse_document(&self, path: &Path) -> Result<Document> {
+        Ok(Document {
+            text: self.parse(path)?,
+            ..Document::default()
+        })
+    }
+    /// File extensions this parser handles, in lowercase and without the dot.
     fn supported_extensions(&self) -> &[&str];
 }
 
+/// Reads plain text files.
 pub struct PlainTextParser;
 
 impl Parser for PlainTextParser {
@@ -26,11 +70,16 @@ impl Parser for PlainTextParser {
     }
 }
 
+/// Reads Markdown and keeps its text without the markup.
 pub struct MarkdownParser;
 
 impl Parser for MarkdownParser {
     fn parse(&self, path: &Path) -> Result<String> {
-        Ok(markdown_to_text(&read_text(path)?))
+        Ok(self.parse_document(path)?.text)
+    }
+
+    fn parse_document(&self, path: &Path) -> Result<Document> {
+        Ok(markdown_document(&read_text(path)?))
     }
 
     fn supported_extensions(&self) -> &[&str] {
@@ -38,6 +87,7 @@ impl Parser for MarkdownParser {
     }
 }
 
+/// Extracts visible text from HTML, leaving out scripts, styles and other non-visible content.
 pub struct HtmlParser;
 
 impl Parser for HtmlParser {
@@ -50,15 +100,22 @@ impl Parser for HtmlParser {
     }
 }
 
+/// Extracts text from PDF files.
+#[cfg(feature = "native")]
 pub struct PdfParser;
 
+#[cfg(feature = "native")]
 impl Parser for PdfParser {
     fn parse(&self, path: &Path) -> Result<String> {
+        Ok(self.parse_document(path)?.text)
+    }
+
+    fn parse_document(&self, path: &Path) -> Result<Document> {
         check_size(path, MAX_FILE_BYTES)?;
 
         // pdf-extract can panic on malformed files. Contain that panic so one bad
         // document returns an error instead of aborting the process or the FFI call.
-        let extracted = std::panic::catch_unwind(|| pdf_extract::extract_text(path))
+        let pages = std::panic::catch_unwind(|| pdf_extract::extract_text_by_pages(path))
             .map_err(|_| {
                 RagError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -72,14 +129,15 @@ impl Parser for PdfParser {
                 ))
             })?;
 
+        let document = document_from_pages(pages);
         // A scanned PDF has pages but no text layer. Report it instead of indexing nothing.
-        if extracted.trim().is_empty() {
+        if document.text.trim().is_empty() {
             return Err(RagError::EmptyDocument(format!(
                 "{} (no text layer; scanned PDFs need OCR first)",
                 path.display()
             )));
         }
-        Ok(extracted)
+        Ok(document)
     }
 
     fn supported_extensions(&self) -> &[&str] {
@@ -114,7 +172,10 @@ impl Parser for DocxParser {
 }
 
 fn invalid_data(message: String) -> RagError {
-    RagError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, message))
+    RagError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message,
+    ))
 }
 
 /// Extracts the text from WordprocessingML. Text lives in `<w:t>` elements. A `<w:tab/>` is
@@ -134,7 +195,11 @@ fn docx_body_text(xml: &str) -> String {
         rest = &rest[open + close + 1..];
 
         let self_closing = tag.ends_with('/');
-        let name = tag.trim_end_matches('/').split_whitespace().next().unwrap_or("");
+        let name = tag
+            .trim_end_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
         match name {
             "w:t" if !self_closing => in_text = true,
             "/w:t" => in_text = false,
@@ -298,16 +363,19 @@ impl Parser for SourceParser {
 
 /// Every built-in parser. Each file extension is declared by exactly one parser.
 fn builtin_parsers() -> Vec<Box<dyn Parser>> {
-    vec![
+    #[allow(unused_mut)]
+    let mut parsers: Vec<Box<dyn Parser>> = vec![
         Box::new(PlainTextParser),
         Box::new(MarkdownParser),
         Box::new(HtmlParser),
-        Box::new(PdfParser),
         Box::new(CsvParser),
         Box::new(JsonParser),
         Box::new(DocxParser),
         Box::new(SourceParser),
-    ]
+    ];
+    #[cfg(feature = "native")]
+    parsers.push(Box::new(PdfParser));
+    parsers
 }
 
 /// Chooses a parser by file extension. Parsers registered later take precedence, so a
@@ -323,6 +391,7 @@ impl Default for ParserRegistry {
 }
 
 impl ParserRegistry {
+    /// The parsers that ship with the library.
     pub fn builtin() -> Self {
         Self {
             parsers: builtin_parsers(),
@@ -334,6 +403,7 @@ impl ParserRegistry {
         self.parsers.insert(0, parser);
     }
 
+    /// Finds the parser for a path by its extension, ignoring case.
     pub fn for_path(&self, path: &Path) -> Option<&dyn Parser> {
         let ext = path.extension()?.to_str()?.to_lowercase();
         self.parsers
@@ -343,6 +413,7 @@ impl ParserRegistry {
     }
 }
 
+/// Returns the built-in parser for a path, if one handles its extension.
 pub fn get_parser(path: &Path) -> Option<Box<dyn Parser>> {
     let ext = path.extension()?.to_str()?.to_lowercase();
     builtin_parsers()
@@ -377,24 +448,115 @@ fn check_size(path: &Path, limit: u64) -> Result<()> {
 
 /// Keeps the readable text of a Markdown document: headings, paragraphs, list items,
 /// code and link text. Markup such as emphasis markers, links and URLs is dropped.
-fn markdown_to_text(source: &str) -> String {
+/// Joins the text of each page into one document. Every page with text becomes a section
+/// called `page N`, numbered from 1 in the PDF, so a chunk reports the page it starts on.
+/// Pages without text add no section, and the chunks after them report the next page with text.
+#[cfg(feature = "native")]
+fn document_from_pages(pages: Vec<String>) -> Document {
+    let mut text = String::new();
+    let mut headings = Vec::new();
+    for (index, page) in pages.iter().enumerate() {
+        let page = page.trim();
+        if page.is_empty() {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        headings.push(Heading {
+            offset: text.len(),
+            path: format!("page {}", index + 1),
+        });
+        text.push_str(page);
+    }
+    Document {
+        text,
+        headings,
+        ..Document::default()
+    }
+}
+
+/// Parses text that is already in memory, for hosts that cannot read files, such as the browser
+/// build. `kind` names the format: `"text"`, `"markdown"` or `"html"`. The result has the same
+/// text, headings and boundaries that the matching file parser would give.
+pub fn parse_content(kind: &str, content: &str) -> Result<Document> {
+    match kind {
+        "text" => Ok(Document {
+            text: content.to_string(),
+            ..Document::default()
+        }),
+        "markdown" => Ok(markdown_document(content)),
+        "html" => Ok(Document {
+            text: extract_text_from_html(content)?,
+            ..Document::default()
+        }),
+        other => Err(RagError::UnsupportedFormat(other.to_string())),
+    }
+}
+
+/// Plain text and headings from Markdown. Each heading's path is the chain of headings above it.
+fn markdown_document(source: &str) -> Document {
     let mut out = String::with_capacity(source.len());
+    let mut headings = Vec::new();
+    // The start and end of every code block, so that no chunk runs from prose into code or
+    // from one code block into another.
+    let mut boundaries = Vec::new();
+    // The headings that enclose the current position, outermost first.
+    let mut outline: Vec<(HeadingLevel, String)> = Vec::new();
+    // The heading being read: its level, the offset of its text in `out`, and its title so far.
+    let mut open: Option<(HeadingLevel, usize, String)> = None;
     for event in CmarkParser::new(source) {
         match event {
-            Event::Text(text) | Event::Code(text) => out.push_str(&text),
+            Event::Start(Tag::Heading { level, .. }) => {
+                open = Some((level, out.len(), String::new()));
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some((level, offset, title)) = open.take() {
+                    while outline.last().is_some_and(|(outer, _)| *outer >= level) {
+                        outline.pop();
+                    }
+                    let title = title.trim().to_string();
+                    outline.push((level, title));
+                    let path = outline
+                        .iter()
+                        .map(|(_, title)| title.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" > ");
+                    headings.push(Heading { offset, path });
+                }
+                out.push('\n');
+            }
+            Event::Text(text) | Event::Code(text) => {
+                if let Some((_, _, title)) = open.as_mut() {
+                    title.push_str(&text);
+                }
+                out.push_str(&text);
+            }
             Event::SoftBreak | Event::HardBreak => out.push('\n'),
+            Event::Start(Tag::CodeBlock(_)) => boundaries.push(out.len()),
+            Event::End(TagEnd::CodeBlock) => {
+                out.push('\n');
+                boundaries.push(out.len());
+            }
             Event::End(
-                TagEnd::Paragraph
-                | TagEnd::Heading(_)
-                | TagEnd::Item
-                | TagEnd::CodeBlock
-                | TagEnd::BlockQuote(_)
-                | TagEnd::TableRow,
+                TagEnd::Paragraph | TagEnd::Item | TagEnd::BlockQuote(_) | TagEnd::TableRow,
             ) => out.push('\n'),
             _ => {}
         }
     }
-    out.trim().to_string()
+    // Trimming the start moves every offset back by the length of the removed whitespace.
+    let leading = out.len() - out.trim_start().len();
+    for heading in &mut headings {
+        heading.offset = heading.offset.saturating_sub(leading);
+    }
+    for boundary in &mut boundaries {
+        *boundary = boundary.saturating_sub(leading);
+    }
+    Document {
+        text: out.trim().to_string(),
+        headings,
+        boundaries,
+    }
 }
 
 fn extract_text_from_html(html: &str) -> Result<String> {
@@ -409,10 +571,11 @@ fn extract_text_from_html(html: &str) -> Result<String> {
 
     // html5ever repairs malformed markup instead of failing. The repairs are not errors for
     // the reader, but they are logged so that odd documents can be found.
-    if !dom.errors.is_empty() {
+    let errors = dom.errors.borrow();
+    if !errors.is_empty() {
         tracing::debug!(
-            repairs = dom.errors.len(),
-            first = %dom.errors[0],
+            repairs = errors.len(),
+            first = %errors[0],
             "HTML parser repaired malformed markup"
         );
     }
@@ -651,5 +814,93 @@ mod tests {
             registry.for_path(&path).unwrap().parse(&path).unwrap(),
             "custom"
         );
+    }
+
+    #[test]
+    fn markdown_headings_give_section_paths_and_offsets() {
+        let path = write_temp(
+            "guide.md",
+            b"\n# Setup\n\nInstall it.\n\n## Backups\n\nRun nightly.\n\n# Other\n\nFinal.\n",
+        );
+        let doc = MarkdownParser.parse_document(&path).unwrap();
+
+        assert!(
+            doc.text.starts_with("Setup"),
+            "leading blank line is trimmed"
+        );
+        let paths: Vec<&str> = doc.headings.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, ["Setup", "Setup > Backups", "Other"]);
+        // Each heading offset points at its own title in the text, after the trim.
+        assert!(doc.text[doc.headings[0].offset..].starts_with("Setup"));
+        assert!(doc.text[doc.headings[1].offset..].starts_with("Backups"));
+        assert!(doc.text[doc.headings[2].offset..].starts_with("Other"));
+
+        assert_eq!(doc.section_at(0), Some("Setup".to_string()));
+        let run = doc.text.find("Run nightly").unwrap();
+        assert_eq!(doc.section_at(run), Some("Setup > Backups".to_string()));
+        let last = doc.text.find("Final").unwrap();
+        assert_eq!(doc.section_at(last), Some("Other".to_string()));
+    }
+
+    #[test]
+    fn markdown_code_block_edges_are_boundaries() {
+        let path = write_temp(
+            "code.md",
+            br#"Intro words here.
+
+```
+let x = 1;
+```
+
+Outro words."#,
+        );
+        let doc = MarkdownParser.parse_document(&path).unwrap();
+        assert_eq!(doc.boundaries.len(), 2);
+        assert!(doc.text[doc.boundaries[0]..].starts_with("let x"));
+        assert!(doc.text[..doc.boundaries[1]]
+            .trim_end()
+            .ends_with("let x = 1;"));
+        assert!(doc.text[doc.boundaries[1]..].starts_with("Outro"));
+        assert!(doc.headings.is_empty());
+    }
+
+    #[test]
+    fn documents_without_headings_have_no_section() {
+        let path = write_temp("plain.md", b"Just a paragraph.");
+        let doc = MarkdownParser.parse_document(&path).unwrap();
+        assert!(doc.headings.is_empty());
+        assert_eq!(doc.section_at(0), None);
+        // Other formats use the default, which has no headings.
+        let txt = write_temp("plain.txt", b"Just text.");
+        assert_eq!(
+            PlainTextParser.parse_document(&txt).unwrap().section_at(0),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn pdf_pages_become_sections() {
+        let doc = document_from_pages(vec![
+            "  First page.  ".to_string(),
+            String::new(),
+            "Third page.".to_string(),
+        ]);
+        assert_eq!(doc.text, "First page.\n\nThird page.");
+        let paths: Vec<&str> = doc.headings.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, ["page 1", "page 3"]);
+        assert_eq!(doc.section_at(0), Some("page 1".to_string()));
+        assert_eq!(
+            doc.section_at(doc.text.find("Third").unwrap()),
+            Some("page 3".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "native")]
+    fn scanned_pdf_pages_give_no_text() {
+        let doc = document_from_pages(vec![String::new(), "  ".to_string()]);
+        assert!(doc.text.trim().is_empty());
+        assert!(doc.headings.is_empty());
     }
 }
