@@ -43,6 +43,9 @@ jobs:
           --release
           --out-dir pkg
 
+      - name: Run the wasm tests in Node
+        run: wasm-pack test --node tpt-rag-wasm
+
       - name: Set package version
         working-directory: tpt-rag-wasm/pkg
         run: |

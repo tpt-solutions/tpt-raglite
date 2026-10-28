@@ -111,3 +111,24 @@ jobs:
           cd "$(mktemp -d)"
           RAGLITE_MODEL="$GITHUB_WORKSPACE/models/all-MiniLM-L6-v2.onnx" \
             python "$GITHUB_WORKSPACE/examples/python_quickstart.py"
+
+  wasm:
+    name: WebAssembly (build and Node tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Check the core without native dependencies for wasm32
+        run: cargo check -p tpt-rag-core --lib --no-default-features --target wasm32-unknown-unknown
+      - name: Build the browser package
+        run: wasm-pack build tpt-rag-wasm --target web --release
+      - name: Run the wasm tests in Node
+        run: wasm-pack test --node tpt-rag-wasm
