@@ -3,6 +3,9 @@ use std::sync::Mutex;
 
 use crate::error::{RagError, Result};
 use crate::tokenizer::WordPieceTokenizer;
+use crate::vector::normalize;
+
+pub use crate::vector::cosine_similarity;
 
 /// Longest input the model accepts (BERT-style position embeddings).
 pub(crate) const MAX_SEQ_LEN: usize = 512;
@@ -140,16 +143,6 @@ pub(crate) fn pool_output(
     Ok(vectors)
 }
 
-/// Scales `vector` to unit length, so cosine similarity is a plain dot product.
-pub(crate) fn normalize(vector: &mut [f32]) {
-    let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for x in vector {
-            *x /= norm;
-        }
-    }
-}
-
 /// Pads encoded sequences to a common length and builds the input tensors' data.
 /// Returns `(input_ids, attention_mask, seq_len)`, all row-major.
 pub(crate) fn pad_batch(sequences: &[Vec<i64>], pad_id: i64) -> (Vec<i64>, Vec<i64>, usize) {
@@ -166,6 +159,7 @@ pub(crate) fn pad_batch(sequences: &[Vec<i64>], pad_id: i64) -> (Vec<i64>, Vec<i
     (ids, mask, seq_len)
 }
 
+/// A sentence-embedding model run through ONNX Runtime. Load it once and reuse it.
 pub struct EmbeddingModel {
     session: Mutex<ort::session::Session>,
     tokenizer: WordPieceTokenizer,
@@ -301,41 +295,10 @@ impl EmbeddingModel {
     }
 }
 
-pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let norm_a = dot(a, a).sqrt();
-    let norm_b = dot(b, b).sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 {
-        0.0
-    } else {
-        dot(a, b) / (norm_a * norm_b)
-    }
-}
-
-/// Dot product of the common prefix of `a` and `b`. The sum is kept in eight independent
-/// lanes. A single running sum is a chain of dependent additions that the compiler cannot
-/// vectorize, and this is the hot loop of the index.
-pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
-    let n = a.len().min(b.len());
-    let main = n - n % 8;
-    let (a_main, a_tail) = a[..n].split_at(main);
-    let (b_main, b_tail) = b[..n].split_at(main);
-
-    let mut lanes = [0.0f32; 8];
-    for (ca, cb) in a_main.chunks_exact(8).zip(b_main.chunks_exact(8)) {
-        for (lane, (x, y)) in lanes.iter_mut().zip(ca.iter().zip(cb)) {
-            *lane += x * y;
-        }
-    }
-    let tail: f32 = a_tail.iter().zip(b_tail).map(|(x, y)| x * y).sum();
-    lanes.iter().sum::<f32>() + tail
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vector::dot;
 
     #[test]
     fn test_cosine_similarity_identical() {

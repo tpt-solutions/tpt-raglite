@@ -13,6 +13,7 @@ use crate::error::{RagError, Result};
 /// Words longer than this become a single `[UNK]`, as in the reference implementation.
 const MAX_WORD_CHARS: usize = 100;
 
+/// BERT-style WordPiece tokenizer, loaded from a `vocab.txt` file.
 pub struct WordPieceTokenizer {
     vocab: HashMap<String, i64>,
     unk_id: i64,
@@ -22,11 +23,13 @@ pub struct WordPieceTokenizer {
 }
 
 impl WordPieceTokenizer {
+    /// Loads the vocabulary from a `vocab.txt` file with one token per line.
     pub fn from_vocab_file(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)?;
         Self::from_vocab(text.lines())
     }
 
+    /// Builds the tokenizer from vocabulary lines, where each line's position is its id.
     pub fn from_vocab<'a>(lines: impl Iterator<Item = &'a str>) -> Result<Self> {
         let vocab: HashMap<String, i64> = lines
             .enumerate()
@@ -54,6 +57,7 @@ impl WordPieceTokenizer {
         })
     }
 
+    /// Id of the `[PAD]` token.
     pub fn pad_id(&self) -> i64 {
         self.pad_id
     }
