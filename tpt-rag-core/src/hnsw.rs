@@ -7,14 +7,15 @@ use ordered_float::NotNan;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::embedding::{dot, normalize};
 use crate::error::{RagError, Result};
+use crate::vector::{dot, normalize};
 
 /// Highest layer a node can be assigned to.
 const MAX_LEVEL: usize = 16;
 const MAGIC: &[u8; 8] = b"TPTHNSW\0";
 const FORMAT_VERSION: u64 = 4;
 
+/// Approximate nearest-neighbour index over cosine distance (HNSW), with disk persistence.
 pub struct HnswIndex {
     dim: usize,
     m: usize,
@@ -50,6 +51,8 @@ fn distance(a: &[f32], b: &[f32]) -> NotNan<f32> {
 }
 
 impl HnswIndex {
+    /// Creates an empty index for vectors of `dim` values. `m` is the number of links per
+    /// node and `ef_construction` the candidate list size used while building.
     pub fn new(dim: usize, m: usize, ef_construction: usize) -> Self {
         Self {
             dim,
@@ -66,6 +69,7 @@ impl HnswIndex {
         }
     }
 
+    /// The epoch this index was built with. See the field documentation.
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -81,14 +85,17 @@ impl HnswIndex {
         id < self.vectors.len() && self.deleted.insert(id)
     }
 
+    /// Number of vectors stored in the index.
     pub fn len(&self) -> usize {
         self.vectors.len()
     }
 
+    /// Returns true when the index holds no vectors.
     pub fn is_empty(&self) -> bool {
         self.vectors.is_empty()
     }
 
+    /// Adds a vector and returns its id. Vectors are normalized. Fails if the length is not the index dimension.
     pub fn insert(&mut self, mut vector: Vec<f32>) -> Result<usize> {
         self.check_dim(vector.len())?;
         normalize(&mut vector);
@@ -169,6 +176,41 @@ impl HnswIndex {
             .take(top_k)
             .map(|c| (c.id, -c.distance.into_inner()))
             .collect())
+    }
+
+    /// The stored (unit-length) vector for an id, or `None` if the id is unknown.
+    pub fn vector(&self, id: usize) -> Option<&[f32]> {
+        self.vectors.get(id).map(Vec::as_slice)
+    }
+
+    /// Maximal marginal relevance: picks up to `top_k` of the `candidates` (`(id, similarity
+    /// to the query)` pairs), trading relevance against similarity to what is already picked.
+    /// `relevance_weight` is 1.0 for plain relevance order and 0.0 for maximum diversity.
+    /// Each pick maximizes `w * relevance - (1 - w) * max similarity to a picked vector`.
+    pub fn diversify(
+        &self,
+        candidates: &[(usize, f32)],
+        top_k: usize,
+        relevance_weight: f32,
+    ) -> Vec<(usize, f32)> {
+        let weight = relevance_weight.clamp(0.0, 1.0);
+        let mut remaining = candidates.to_vec();
+        let mut chosen: Vec<(usize, f32)> = Vec::with_capacity(top_k.min(remaining.len()));
+        while chosen.len() < top_k && !remaining.is_empty() {
+            let mut best = (0, f32::NEG_INFINITY);
+            for (position, &(id, relevance)) in remaining.iter().enumerate() {
+                let redundancy = chosen
+                    .iter()
+                    .filter_map(|&(picked, _)| Some(dot(self.vector(id)?, self.vector(picked)?)))
+                    .fold(0.0f32, f32::max);
+                let score = weight * relevance - (1.0 - weight) * redundancy;
+                if score > best.1 {
+                    best = (position, score);
+                }
+            }
+            chosen.push(remaining.swap_remove(best.0));
+        }
+        chosen
     }
 
     fn check_dim(&self, len: usize) -> Result<()> {
@@ -314,57 +356,76 @@ impl HnswIndex {
 
     /// Writes the index atomically: data goes to a temp file, is synced, then renamed
     /// over `path`, so a crash never leaves a half-written index behind.
+    /// Writes the index in the file format that [`HnswIndex::load_from_disk`] reads, ending
+    /// with a checksum. Returns the writer so the caller can flush or sync it.
+    pub fn write_to<W: Write>(&self, out: W) -> Result<W> {
+        let mut writer = HashingWriter::new(out);
+
+        writer.write_all(MAGIC)?;
+        write_u64(&mut writer, FORMAT_VERSION)?;
+        write_u64(&mut writer, self.dim as u64)?;
+        write_u64(&mut writer, self.m as u64)?;
+        write_u64(&mut writer, self.ef_construction as u64)?;
+        write_u64(&mut writer, self.vectors.len() as u64)?;
+        write_u64(&mut writer, self.max_layer as u64)?;
+        write_u64(&mut writer, self.entry_point.map_or(u64::MAX, |e| e as u64))?;
+        write_u64(&mut writer, self.epoch)?;
+
+        write_u64(&mut writer, self.layers.len() as u64)?;
+        for layer in &self.layers {
+            write_u64(&mut writer, layer.len() as u64)?;
+            for (&id, neighbors) in layer {
+                write_u64(&mut writer, id as u64)?;
+                write_u64(&mut writer, neighbors.len() as u64)?;
+                for &nid in neighbors {
+                    write_u64(&mut writer, nid as u64)?;
+                }
+            }
+        }
+
+        for vector in &self.vectors {
+            for &v in vector {
+                writer.write_all(&v.to_le_bytes())?;
+            }
+        }
+
+        let mut deleted: Vec<usize> = self.deleted.iter().copied().collect();
+        deleted.sort_unstable();
+        write_u64(&mut writer, deleted.len() as u64)?;
+        for id in deleted {
+            write_u64(&mut writer, id as u64)?;
+        }
+
+        let checksum = writer.hash;
+        let mut out = writer.inner;
+        out.write_all(&checksum.to_le_bytes())?;
+        out.flush()?;
+        Ok(out)
+    }
+
+    /// The index as bytes, in the same format as the file written by [`HnswIndex::flush`].
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        self.write_to(Vec::new())
+    }
+
+    /// Writes the index to `path` through a temporary file, so a crash never leaves a
+    /// half-written index under the real name.
     pub fn flush(&self, path: &Path) -> Result<()> {
         let tmp_path = path.with_extension("bin.tmp");
         {
             let file = std::fs::File::create(&tmp_path)?;
-            let mut writer = HashingWriter::new(BufWriter::new(file));
-
-            writer.write_all(MAGIC)?;
-            write_u64(&mut writer, FORMAT_VERSION)?;
-            write_u64(&mut writer, self.dim as u64)?;
-            write_u64(&mut writer, self.m as u64)?;
-            write_u64(&mut writer, self.ef_construction as u64)?;
-            write_u64(&mut writer, self.vectors.len() as u64)?;
-            write_u64(&mut writer, self.max_layer as u64)?;
-            write_u64(&mut writer, self.entry_point.map_or(u64::MAX, |e| e as u64))?;
-            write_u64(&mut writer, self.epoch)?;
-
-            write_u64(&mut writer, self.layers.len() as u64)?;
-            for layer in &self.layers {
-                write_u64(&mut writer, layer.len() as u64)?;
-                for (&id, neighbors) in layer {
-                    write_u64(&mut writer, id as u64)?;
-                    write_u64(&mut writer, neighbors.len() as u64)?;
-                    for &nid in neighbors {
-                        write_u64(&mut writer, nid as u64)?;
-                    }
-                }
-            }
-
-            for vector in &self.vectors {
-                for &v in vector {
-                    writer.write_all(&v.to_le_bytes())?;
-                }
-            }
-
-            let mut deleted: Vec<usize> = self.deleted.iter().copied().collect();
-            deleted.sort_unstable();
-            write_u64(&mut writer, deleted.len() as u64)?;
-            for id in deleted {
-                write_u64(&mut writer, id as u64)?;
-            }
-
-            let checksum = writer.hash;
-            let mut file = writer.inner;
-            file.write_all(&checksum.to_le_bytes())?;
-            file.flush()?;
-            file.get_ref().sync_all()?;
+            let file = self
+                .write_to(BufWriter::new(file))?
+                .into_inner()
+                .map_err(|e| e.into_error())?;
+            file.sync_all()?;
         }
         std::fs::rename(&tmp_path, path)?;
         Ok(())
     }
 
+    /// Loads an index written by [`HnswIndex::flush`], validating the header, the
+    /// checksum and every node and neighbor id before the index is returned.
     /// Loads an index written by [`HnswIndex::flush`], validating the header, the
     /// checksum and every node and neighbor id before the index is returned.
     pub fn load_from_disk(
@@ -374,7 +435,22 @@ impl HnswIndex {
         ef_construction: usize,
     ) -> Result<Self> {
         let file = std::fs::File::open(path)?;
-        let mut reader = HashingReader::new(BufReader::new(file));
+        Self::read_from(BufReader::new(file), dim, m, ef_construction)
+    }
+
+    /// Reads an index from bytes in the format of [`HnswIndex::to_bytes`].
+    pub fn from_bytes(bytes: &[u8], dim: usize, m: usize, ef_construction: usize) -> Result<Self> {
+        Self::read_from(bytes, dim, m, ef_construction)
+    }
+
+    /// Reads an index from any reader. The same checks as [`HnswIndex::load_from_disk`] apply.
+    pub fn read_from<R: Read>(
+        input: R,
+        dim: usize,
+        m: usize,
+        ef_construction: usize,
+    ) -> Result<Self> {
+        let mut reader = HashingReader::new(input);
 
         let mut magic = [0u8; 8];
         reader.read_exact(&mut magic)?;
@@ -513,6 +589,13 @@ fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
     bytes
         .iter()
         .fold(hash, |h, &b| (h ^ u64::from(b)).wrapping_mul(FNV_PRIME))
+}
+
+/// A 64-bit FNV-1a hash of file contents, as 16 hex digits. Stored between runs, so the
+/// function must not change.
+#[cfg(feature = "native")]
+pub(crate) fn content_hash(bytes: &[u8]) -> String {
+    format!("{:016x}", fnv1a(FNV_OFFSET, bytes))
 }
 
 /// Writer that keeps a running checksum of everything written through it.
@@ -754,5 +837,19 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn diversify_prefers_a_different_direction_over_a_near_duplicate() {
+        let mut index = HnswIndex::new(2, 4, 20);
+        let a = index.insert(vec![1.0, 0.0]).unwrap();
+        let twin = index.insert(vec![0.99, 0.1]).unwrap();
+        let b = index.insert(vec![0.0, 1.0]).unwrap();
+        let candidates = [(a, 0.9), (twin, 0.89), (b, 0.1)];
+
+        let ids = |picked: Vec<(usize, f32)>| picked.into_iter().map(|p| p.0).collect::<Vec<_>>();
+        assert_eq!(ids(index.diversify(&candidates, 2, 1.0)), vec![a, twin]);
+        assert_eq!(ids(index.diversify(&candidates, 2, 0.5)), vec![a, b]);
+        assert_eq!(index.diversify(&candidates, 0, 0.5), vec![]);
     }
 }

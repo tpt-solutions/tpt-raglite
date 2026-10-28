@@ -76,7 +76,11 @@ fn main() {
     println!(
         "data: {} vectors, {}",
         vectors,
-        if clustered { "clustered" } else { "uniform random" }
+        if clustered {
+            "clustered"
+        } else {
+            "uniform random"
+        }
     );
 
     let start = Instant::now();
@@ -94,9 +98,7 @@ fn main() {
     let mut latencies_us: Vec<f64> = Vec::with_capacity(queries);
     for &qi in &query_ids {
         let t = Instant::now();
-        let hits = index
-            .search(&data[qi], TOP_K, ef_search)
-            .expect("search");
+        let hits = index.search(&data[qi], TOP_K, ef_search).expect("search");
         latencies_us.push(t.elapsed().as_secs_f64() * 1e6);
         assert!(!hits.is_empty());
     }
