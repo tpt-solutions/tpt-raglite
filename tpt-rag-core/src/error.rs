@@ -23,6 +23,15 @@ pub enum RagError {
 
     #[error("HNSW index error: {0}")]
     Hnsw(String),
+
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
+
+    #[error("File {path} is {size} bytes, over the {limit} byte limit")]
+    TooLarge { path: String, size: u64, limit: u64 },
+
+    #[error("database schema version {stored} is newer than this library supports ({supported}); upgrade tpt-raglite")]
+    SchemaTooNew { stored: u32, supported: u32 },
 }
 
 pub type Result<T> = std::result::Result<T, RagError>;

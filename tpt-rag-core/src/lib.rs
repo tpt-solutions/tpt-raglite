@@ -1,4 +1,5 @@
 pub mod chunker;
+pub mod config;
 pub mod embedding;
 pub mod error;
 pub mod hnsw;
@@ -7,7 +8,12 @@ pub mod parser;
 pub mod raglite;
 #[cfg(feature = "reranking")]
 pub mod reranker;
+pub mod tokenizer;
 
+pub use chunker::{ChunkConfig, SemanticChunker};
+pub use config::RagConfig;
 pub use error::RagError;
-pub use raglite::{Metadata, RAGLite, SearchResult};
-pub use chunker::SemanticChunker;
+pub use parser::{Parser, ParserRegistry};
+pub use raglite::{
+    Check, IngestReport, Metadata, QueryFilter, RAGLite, SearchResult, Stats, SCHEMA_VERSION,
+};
