@@ -64,6 +64,16 @@ struct PySearchResult {
     /// Ingestion time, in seconds since the Unix epoch.
     #[pyo3(get)]
     created_at: u64,
+    /// Byte offset where the chunk starts in the text it was cut from, or None for chunks
+    /// ingested before schema version 2.
+    #[pyo3(get)]
+    start_offset: Option<u64>,
+    /// Byte offset just past the end of the chunk, or None (see `start_offset`).
+    #[pyo3(get)]
+    end_offset: Option<u64>,
+    /// Heading path of the section the chunk starts in (Markdown), or None.
+    #[pyo3(get)]
+    section: Option<String>,
 }
 
 #[pymethods]
@@ -86,6 +96,9 @@ impl From<SearchResult> for PySearchResult {
             tags: r.tags,
             chunk_id: r.chunk_id,
             created_at: r.created_at,
+            start_offset: r.start_offset,
+            end_offset: r.end_offset,
+            section: r.section,
         }
     }
 }
@@ -220,6 +233,47 @@ impl PyRAGLite {
         report_to_dict(py, &report)
     }
 
+    /// Brings the database in line with a folder. Returns a dict with `indexed` (paths ingested
+    /// because they are new or changed), `unchanged` (count), `removed` (sources whose file is
+    /// gone) and `failed` (list of `(path, reason)` pairs). Call it again to pick up changes.
+    #[pyo3(signature = (path, tags = None))]
+    fn sync_directory<'py>(
+        &self,
+        py: Python<'py>,
+        path: &str,
+        tags: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let tags = tags.unwrap_or_default();
+        let dir = PathBuf::from(path);
+        let report = py
+            .detach(|| -> Result<_, RagError> {
+                let rag = self.lock()?;
+                let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+                rag.sync_directory(&dir, &tag_refs)
+            })
+            .map_err(to_py_err)?;
+        let out = PyDict::new(py);
+        out.set_item(
+            "indexed",
+            report
+                .indexed
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        )?;
+        out.set_item("unchanged", report.unchanged)?;
+        out.set_item("removed", report.removed.clone())?;
+        out.set_item(
+            "failed",
+            report
+                .failed
+                .iter()
+                .map(|(p, reason)| (p.to_string_lossy().into_owned(), reason.clone()))
+                .collect::<Vec<_>>(),
+        )?;
+        Ok(out)
+    }
+
     #[pyo3(signature = (text, source = None, tags = None))]
     fn add_text(
         &self,
@@ -238,8 +292,9 @@ impl PyRAGLite {
 
     /// Returns the `top_k` most similar chunks. Scores are cosine similarities. `tags` keeps
     /// only chunks that carry every given tag, and `source_prefix` only chunks whose source
-    /// starts with the text. A selective filter can return fewer than `top_k` results.
-    #[pyo3(signature = (text, top_k = 5, tags = None, source_prefix = None))]
+    /// starts with the text, and `since` (Unix seconds) only chunks ingested at or after that
+    /// time. A selective filter can return fewer than `top_k` results.
+    #[pyo3(signature = (text, top_k = 5, tags = None, source_prefix = None, since = None))]
     fn query(
         &self,
         py: Python<'_>,
@@ -247,12 +302,16 @@ impl PyRAGLite {
         top_k: usize,
         tags: Option<Vec<String>>,
         source_prefix: Option<String>,
+        since: Option<u64>,
     ) -> PyResult<Vec<PySearchResult>> {
         let filter = QueryFilter {
             tags: tags.unwrap_or_default(),
             source_prefix,
+            created_since: since,
         };
-        let filtered = !filter.tags.is_empty() || filter.source_prefix.is_some();
+        let filtered = !filter.tags.is_empty()
+            || filter.source_prefix.is_some()
+            || filter.created_since.is_some();
         py.detach(|| -> Result<_, RagError> {
             let rag = self.lock()?;
             if filtered {
@@ -312,6 +371,39 @@ impl PyRAGLite {
         py.detach(|| -> Result<_, RagError> { self.lock()?.query_hybrid(text, top_k, alpha) })
             .map(to_py_results)
             .map_err(to_py_err)
+    }
+
+    /// The chunks just before and after `chunk_id` in the same document, at most `radius` on
+    /// each side, in document order. The chunk itself is left out, so keep the hit you got
+    /// the chunk id from. Neighbours have a score of 0.0.
+    #[pyo3(signature = (chunk_id, radius = 1))]
+    fn neighbors(
+        &self,
+        py: Python<'_>,
+        chunk_id: u64,
+        radius: usize,
+    ) -> PyResult<Vec<PySearchResult>> {
+        py.detach(|| -> Result<_, RagError> { self.lock()?.neighbors(chunk_id, radius) })
+            .map(to_py_results)
+            .map_err(to_py_err)
+    }
+
+    /// Relevant results that are not near-duplicates of each other (maximal marginal
+    /// relevance). `relevance_weight` is 1.0 for plain relevance order and 0.0 for the most
+    /// varied results.
+    #[pyo3(signature = (text, top_k = 5, relevance_weight = 0.5))]
+    fn query_diverse(
+        &self,
+        py: Python<'_>,
+        text: &str,
+        top_k: usize,
+        relevance_weight: f32,
+    ) -> PyResult<Vec<PySearchResult>> {
+        py.detach(|| -> Result<_, RagError> {
+            self.lock()?.query_diverse(text, top_k, relevance_weight)
+        })
+        .map(to_py_results)
+        .map_err(to_py_err)
     }
 
     /// Vector search followed by cross-encoder reranking. Needs a reranker model.

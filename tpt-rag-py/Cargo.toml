@@ -6,6 +6,9 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Python wrapper for tpt-raglite (via PyO3)"
+readme = "README.md"
+keywords = ["rag", "python", "pyo3", "embeddings", "vector-search"]
+categories = ["api-bindings", "database-implementations"]
 
 [lib]
 crate-type = ["cdylib"]

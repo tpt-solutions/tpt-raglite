@@ -7,6 +7,8 @@ name = "tpt-raglite"
 version = "0.1.0"
 description = "The SQLite for AI — Blazing-fast, embeddable, zero-configuration RAG engine"
 license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["rag", "embeddings", "vector-search", "retrieval", "sqlite"]
 requires-python = ">=3.9"
 authors = [
     { name = "TPT Solutions" }

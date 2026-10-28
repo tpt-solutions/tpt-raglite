@@ -185,3 +185,82 @@ def test_reranking_without_a_model_is_an_error(db):
     db.add_text("Saturn has rings.", source="saturn")
     with pytest.raises(ModelError, match="reranker"):
         db.query_reranked("rings", top_k=1)
+
+
+def test_diverse_query_and_since_filter(db):
+    db.add_text("Jupiter is the largest planet in the solar system.", source="a")
+    db.add_text("Jupiter is the largest planet in our solar system.", source="b")
+    db.add_text("Bananas are a good source of potassium.", source="c")
+    question = "largest planet in the solar system"
+
+    plain = [r.chunk_id for r in db.query(question, top_k=2)]
+    relevant = [r.chunk_id for r in db.query_diverse(question, top_k=2, relevance_weight=1.0)]
+    assert relevant == plain
+
+    varied = db.query_diverse(question, top_k=2, relevance_weight=0.0)
+    assert "Bananas" in varied[1].text
+
+    assert db.query(question, top_k=5, since=2**40) == []
+    assert len(db.query(question, top_k=5, since=0)) == 3
+
+
+def test_results_carry_offsets_into_the_source_text(db):
+    # ASCII only: Python string indexes are characters, while the offsets are bytes.
+    text = " ".join(["Backups run every night at two in the morning."] * 150)
+    db.add_text(text, source="long")
+    hits = db.query("when do backups run", top_k=5)
+    assert hits
+    for hit in hits:
+        assert text[hit.start_offset : hit.end_offset] == hit.text
+
+
+def test_neighbors_return_the_chunks_around_a_hit(db):
+    text = " ".join(["Backups run every night at two in the morning."] * 150)
+    db.add_text(text, source="long")
+    hit = db.query("when do backups run", top_k=1)[0]
+    around = db.neighbors(hit.chunk_id, radius=1)
+    assert 0 < len(around) <= 2
+    assert all(n.source == "long" and n.chunk_id != hit.chunk_id for n in around)
+
+
+def test_markdown_results_report_their_section(db, tmp_path):
+    body_a = "Backups run every night at two in the morning. " * 60
+    body_b = "Tea is served warm in the lounge every afternoon. " * 60
+    guide = tmp_path / "guide.md"
+    guide.write_text(f"# Setup\n\n{body_a}\n\n# Lounge\n\n{body_b}", encoding="utf-8")
+    db.add_files([str(guide)])
+    assert db.query("when do backups run", top_k=1)[0].section == "Setup"
+    assert db.query("where is tea served", top_k=1)[0].section == "Lounge"
+
+
+def test_pdf_results_report_their_page(db):
+    db.add_files([str(FIXTURES / "sample.pdf")])
+    hit = db.query("which planet is known as the red planet", top_k=1)[0]
+    assert hit.section == "page 1"
+
+
+def test_sync_directory_indexes_changes_and_removes(db, tmp_path):
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "a.md").write_text("Backups run every night at two.", encoding="utf-8")
+    (notes / "b.txt").write_text("Tomato plants need full sun.", encoding="utf-8")
+
+    first = db.sync_directory(str(notes))
+    assert len(first["indexed"]) == 2
+    again = db.sync_directory(str(notes))
+    assert again["indexed"] == [] and again["unchanged"] == 2
+
+    (notes / "b.txt").unlink()
+    gone = db.sync_directory(str(notes))
+    assert len(gone["removed"]) == 1 and gone["removed"][0].endswith("b.txt")
+    assert all(not r.source.endswith("b.txt") for r in db.query("tomato plants", top_k=5))
+
+
+def test_chunks_do_not_cross_headings(db, tmp_path):
+    body_a = "Backups run every night at two in the morning. " * 60
+    body_b = "Tea is served warm in the lounge every afternoon. " * 60
+    guide = tmp_path / "guide.md"
+    guide.write_text(f"# Setup\n\n{body_a}\n\n# Lounge\n\n{body_b}", encoding="utf-8")
+    db.add_files([str(guide)])
+    for hit in db.query("backups tea lounge", top_k=10):
+        assert not ("Backups" in hit.text and "Tea" in hit.text), hit.text

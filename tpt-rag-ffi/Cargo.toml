@@ -6,6 +6,9 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "C ABI / FFI boundary for tpt-raglite"
+readme = "README.md"
+keywords = ["rag", "ffi", "c-api", "embeddings", "vector-search"]
+categories = ["api-bindings", "development-tools::ffi"]
 
 [lib]
 crate-type = ["cdylib", "staticlib"]
