@@ -6,15 +6,16 @@ build-backend = "maturin"
 name = "tpt-raglite"
 version = "0.1.0"
 description = "The SQLite for AI — Blazing-fast, embeddable, zero-configuration RAG engine"
-license = { text = "MIT OR Apache-2.0" }
+license = "MIT OR Apache-2.0"
 requires-python = ">=3.9"
 authors = [
     { name = "TPT Solutions" }
 ]
+# No "License ::" classifiers: the license expression above already says MIT OR Apache-2.0,
+# and classifiers listing both licenses would contradict it.
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
