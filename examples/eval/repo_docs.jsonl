@@ -1,0 +1,26 @@
+{"query": "how do I download the embedding model files", "expected_source": "README.md"}
+{"query": "what license is the project under", "expected_source": "README.md"}
+{"query": "how do I search from Python with a context manager", "expected_source": "README.md"}
+{"query": "what does the HTTP API refuse without authentication", "expected_source": "README.md"}
+{"query": "how do I connect an MCP client to the database", "expected_source": "README.md"}
+{"query": "how is the database kept intact if the process crashes", "expected_source": "README.md"}
+{"query": "what happens when a newer library version opens my database", "expected_source": "README.md"}
+{"query": "which score range does hybrid search return", "expected_source": "README.md"}
+{"query": "how are PDF citations reported by page", "expected_source": "README.md"}
+{"query": "how do I sync a folder and remove notes that were deleted", "expected_source": "README.md"}
+{"query": "why is reranking not available in the browser", "expected_source": "README.md"}
+{"query": "how large is the browser package", "expected_source": "README.md"}
+{"query": "what does the chunk window size control", "expected_source": "README.md"}
+{"query": "how do I watch a folder for changes every 30 seconds", "expected_source": "README.md"}
+{"query": "when was the notes search template added", "expected_source": "CHANGELOG.md"}
+{"query": "which change made chunks respect headings and code blocks", "expected_source": "CHANGELOG.md"}
+{"query": "which dependency provides the HTTP server", "expected_source": "CHANGELOG.md"}
+{"query": "what does schema version 4 add to the database", "expected_source": "CHANGELOG.md"}
+{"query": "which release added nDCG to the eval command", "expected_source": "CHANGELOG.md"}
+{"query": "how do the eval cases from synth differ from real questions", "expected_source": "CHANGELOG.md"}
+{"query": "is the benchmark for a million vectors finished", "expected_source": "todo.md"}
+{"query": "why was the Dockerfile dropped", "expected_source": "todo.md"}
+{"query": "what happens to the SemanticChunker type", "expected_source": "todo.md"}
+{"query": "why was the decision about WebAssembly reversed", "expected_source": "todo.md"}
+{"query": "what was measured for reranking latency", "expected_source": "todo.md"}
+{"query": "what does the 1M benchmark still need", "expected_source": "todo.md"}

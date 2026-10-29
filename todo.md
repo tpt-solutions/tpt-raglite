@@ -163,7 +163,7 @@
 - [x] Implement `bm25_search(query, top_k) -> Vec<ScoredChunk>`
 - [x] Implement Reciprocal Rank Fusion (RRF) to merge BM25 and vector results
 - [x] Expose `query_hybrid(text, top_k, alpha: f32)` on `RAGLite`
-- [ ] Benchmark recall vs. pure-vector on a document benchmark dataset (not started; needs a labelled dataset)
+- [ ] Benchmark recall vs. pure-vector on a document benchmark dataset (first pass: examples/eval/repo_docs.jsonl, 26 questions written from this repo's own docs, so the scores are optimistic: vector recall@3 0.885, hybrid 0.846, reranked 0.923; the differences are within noise. Still open: a labelled set of real questions, 100 or more) (not started; needs a labelled dataset)
 
 ### CI: Basic CI
 

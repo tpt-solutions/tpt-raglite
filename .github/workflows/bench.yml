@@ -1,0 +1,37 @@
+name: Benchmarks
+
+# Run by hand from the Actions tab (or `gh workflow run bench.yml`). Not run on every push: the
+# 1M-vector index takes about 20 minutes to build on a runner.
+on:
+  workflow_dispatch:
+    inputs:
+      vectors:
+        description: "vectors for the HNSW index benchmark"
+        default: "1000000"
+
+jobs:
+  bench:
+    name: Benchmarks (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch models
+        run: bash scripts/fetch_model.sh
+      - name: HNSW index benchmark
+        run: cargo run --release -p tpt-rag-core --example bench_hnsw -- ${{ inputs.vectors }} 1000 100 1 | tee hnsw.txt
+      - name: Search methods benchmark
+        run: cargo run --release -p tpt-rag-core --example bench_search -- README.md 20 | tee search.txt
+      - name: Machine
+        run: |
+          echo "cpu: $(nproc) cores, $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)"
+          echo "memory: $(free -g | awk '/Mem:/ {print $2}') GB" | tee machine.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks
+          path: |
+            hnsw.txt
+            search.txt
+            machine.txt

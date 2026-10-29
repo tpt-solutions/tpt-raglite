@@ -7,6 +7,9 @@ All notable changes are recorded here. The project follows [Semantic Versioning]
 Nothing is published yet. The first release will be 0.1.0.
 
 ### Added
+- Browser build tested in Chromium (`tpt-rag-wasm/tests/browser`): indexing, meaning and keyword search, markup shown as text, and the saved database after a reload.
+- `raglite eval` takes `--hybrid` and `--rerank`, and `examples/eval/repo_docs.jsonl` is a 26-question set on this repository's docs. Scores on it are optimistic, because the questions were written from those docs.
+- Benchmark workflow (`bench.yml`, run by hand) measures the HNSW index at 1M vectors and the search methods on a CI runner. `examples/bench_search` times vector, hybrid and reranked search.
 - Browser build: hybrid search (`hybrid`), reciprocal rank fusion with the native formula and scale.
 - Browser build: `tpt-rag-wasm` runs the engine in WebAssembly. The host computes embeddings with the same model family (for example transformers.js with quantized all-MiniLM-L6-v2), and the wasm module provides plan, add, query, keyword, export and import, with the native chunk boundaries and an HNSW index. The example in `examples/wasm_browser` stores the database in IndexedDB. The wasm binary is about 0.9 MB. Native code is behind a `native` feature in `tpt-rag-core` (on by default), so the pure parts build for `wasm32-unknown-unknown`.
 

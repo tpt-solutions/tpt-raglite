@@ -43,7 +43,7 @@ commands:
   delete <db> <source>...      remove every chunk from the given sources
   rebuild <db>                 re-embed every chunk and rebuild the index
   eval <db> <cases.jsonl>      score queries: one {\"query\", \"expected_source\"} per line
-      -k <n>                   cut-off for recall@k (default 5)
+      -k <n>                   cut-off for recall@k (default 5); --hybrid <alpha> or --rerank <n> score those modes
   models pull [folder]         download the embedding and reranker models (default ./models)
   synth <db>                   print eval cases made from the chunks, as JSONL
       --per-source <n>         cases per source (default 5)
@@ -470,7 +470,11 @@ fn eval(args: &[String]) -> CliResult {
             .ok_or_else(|| format!("line {line_no}: missing \"expected_source\""))?;
 
         total += 1;
-        let results = rag.query(query, k)?;
+        let results = match (opts.hybrid, opts.rerank) {
+            (_, Some(n)) => rag.query_reranked(query, k, n)?,
+            (Some(alpha), None) => rag.query_hybrid(query, k, alpha)?,
+            (None, None) => rag.query(query, k)?,
+        };
         match results.iter().position(|r| r.source.contains(expected)) {
             Some(rank) => {
                 hits += 1;
