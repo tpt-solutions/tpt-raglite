@@ -62,3 +62,17 @@ fn bad_input_throws_instead_of_panicking() {
     assert!(rag.add("x", vec![], &plan, &[1.0]).is_err());
     assert!(TptRag::import(b"nope").is_err());
 }
+
+#[wasm_bindgen_test]
+fn hybrid_search_returns_fused_results() {
+    let mut rag = TptRag::new(3).unwrap();
+    let plan = rag.plan("text", "Jupiter is the largest planet.").unwrap();
+    rag.add("space", vec![], &plan, &embed(&plan, 3)).unwrap();
+    let plan = rag.plan("text", "Tomato plants need sun.").unwrap();
+    rag.add("garden", vec![], &plan, &embed(&plan, 3)).unwrap();
+
+    let hits: serde_json::Value =
+        serde_json::from_str(&rag.hybrid(&[1.0, 0.0, 0.0], "tomato", 2, 0.5).unwrap()).unwrap();
+    assert_eq!(hits.as_array().unwrap().len(), 2);
+    assert!(hits[0]["score"].as_f64().unwrap() <= 1.0);
+}

@@ -19,6 +19,9 @@ const HNSW_EF_CONSTRUCTION: usize = 200;
 const HNSW_EF_SEARCH: usize = 100;
 
 /// BM25 parameters, the usual defaults.
+/// Reciprocal rank fusion constant from the original RRF paper. Matches the native library.
+const RRF_K: f32 = 60.0;
+
 const BM25_K1: f32 = 1.2;
 const BM25_B: f32 = 0.75;
 
@@ -163,6 +166,50 @@ impl Engine {
             });
         }
         Ok(chunks.len())
+    }
+
+    /// Vector and keyword results fused with reciprocal rank fusion, the same method and the
+    /// same scale as the native `query_hybrid`: `alpha` is the vector weight from 0 to 1, and
+    /// the best possible score is 1.
+    pub fn hybrid(
+        &self,
+        vector: &[f32],
+        text: &str,
+        top_k: usize,
+        alpha: f32,
+    ) -> Result<Vec<Hit>, String> {
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let alpha = if alpha.is_nan() {
+            0.5
+        } else {
+            alpha.clamp(0.0, 1.0)
+        };
+        let candidate_k = top_k.saturating_mul(2);
+        let by_vector = self.query(vector, candidate_k)?;
+        let by_keyword = self.keyword(text, candidate_k);
+
+        let mut fused: HashMap<usize, f32> = HashMap::new();
+        for (rank, hit) in by_vector.iter().enumerate() {
+            *fused.entry(hit.chunk_id).or_insert(0.0) += alpha / (RRF_K + rank as f32 + 1.0);
+        }
+        for (rank, hit) in by_keyword.iter().enumerate() {
+            *fused.entry(hit.chunk_id).or_insert(0.0) +=
+                (1.0 - alpha) / (RRF_K + rank as f32 + 1.0);
+        }
+
+        let scale = RRF_K + 1.0;
+        let mut ranked: Vec<(usize, f32)> = fused
+            .into_iter()
+            .map(|(id, score)| (id, score * scale))
+            .collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        ranked.truncate(top_k);
+        Ok(ranked
+            .into_iter()
+            .filter_map(|(id, score)| self.hit(id, score))
+            .collect())
     }
 
     /// Removes every chunk stored for `source`. Returns how many were removed.
@@ -490,5 +537,27 @@ mod tests {
         );
         assert!(Engine::import(b"not a database").is_err());
         assert!(Engine::import(&[0u8; 4]).is_err());
+    }
+
+    #[test]
+    fn hybrid_follows_the_vector_side_at_one_and_the_keyword_side_at_zero() {
+        let mut engine = Engine::new(3).unwrap();
+        // The vector matches the query exactly, but no word matches. The second chunk has the
+        // word but a vector pointing elsewhere.
+        store(&mut engine, "text", "vector", "Alpha beta gamma.", 0);
+        store(&mut engine, "text", "keyword", "Tomato plants need sun.", 1);
+
+        let by_vector = engine.hybrid(&[1.0, 0.0, 0.0], "tomato", 2, 1.0).unwrap();
+        assert_eq!(by_vector[0].source, "vector");
+        let by_keyword = engine.hybrid(&[1.0, 0.0, 0.0], "tomato", 2, 0.0).unwrap();
+        assert_eq!(by_keyword[0].source, "keyword");
+
+        let fused = engine.hybrid(&[1.0, 0.0, 0.0], "tomato", 2, 0.5).unwrap();
+        assert_eq!(fused.len(), 2);
+        assert!(fused[0].score > 0.0 && fused[0].score <= 1.0);
+        assert!(engine
+            .hybrid(&[1.0, 0.0, 0.0], "tomato", 0, 0.5)
+            .unwrap()
+            .is_empty());
     }
 }

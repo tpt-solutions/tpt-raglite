@@ -7,6 +7,7 @@ All notable changes are recorded here. The project follows [Semantic Versioning]
 Nothing is published yet. The first release will be 0.1.0.
 
 ### Added
+- Browser build: hybrid search (`hybrid`), reciprocal rank fusion with the native formula and scale.
 - Browser build: `tpt-rag-wasm` runs the engine in WebAssembly. The host computes embeddings with the same model family (for example transformers.js with quantized all-MiniLM-L6-v2), and the wasm module provides plan, add, query, keyword, export and import, with the native chunk boundaries and an HNSW index. The example in `examples/wasm_browser` stores the database in IndexedDB. The wasm binary is about 0.9 MB. Native code is behind a `native` feature in `tpt-rag-core` (on by default), so the pure parts build for `wasm32-unknown-unknown`.
 
 - `RagConfig` with HNSW, chunking, flush, and model settings. `RAGLite::open_with_config` takes it. Available in Rust, the C ABI (`tpt_rag_default_config`, `tpt_rag_create_with_config`), and Python (keyword arguments).

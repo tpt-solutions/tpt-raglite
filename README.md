@@ -196,8 +196,8 @@ The example in [`examples/wasm_browser`](examples/wasm_browser) does this with t
 Limits compared with the native library:
 
 - **Formats:** text, Markdown and HTML. PDF, DOCX, CSV, JSON and source code are native-only, because they need file access.
-- **Search:** vector and keyword only. Hybrid fusion, reranking, diverse results and metadata filters are not in the browser yet.
-- **Scores:** keyword scores are BM25, not the fused scores of native hybrid search, so compare results within one method.
+- **Search:** vector, keyword and hybrid search (`hybrid`, reciprocal rank fusion as in the native library). Reranking, diverse results and metadata filters are native-only for now.
+- **Scores:** keyword scores are BM25 and vector scores are cosine similarities. Hybrid scores are fused ranks, so compare results within one method.
 - **Embeddings:** whatever model the host uses. Index and question embeddings must come from the same model.
 - **Size:** about 0.9 MB of wasm before compression.
 

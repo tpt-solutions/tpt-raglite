@@ -81,7 +81,7 @@
 - [x] Add `memmap2` crate for OS-managed paging
 - [x] Implement `HnswIndex::flush()` and `HnswIndex::load_from_disk(path)`
 - [x] Add `RwLock<HnswIndex>` for concurrent reads / exclusive writes
-- [ ] Benchmark: query latency < 10 ms at 1M vectors on CI machine (not started; needs a dedicated machine, see 6E)
+- [ ] Benchmark: query latency < 10 ms at 1M vectors on CI machine. Measured on this machine (Intel i5-13500, WSL2 with 7 GB RAM, release build, `bench_hnsw`, clustered data, ef_search 100): 100k vectors p50 0.40 ms, p99 0.59 ms, recall@10 1.000; 1M vectors p50 0.73 ms, p95 1.18 ms, p99 1.70 ms, recall@10 0.989; insert about 960 vectors/s. The 1M run's flush and load timings were not measured: the WSL VM stopped responding while writing the 1.8 GB index. The CI-machine run is still open
 - [x] Implement semantic chunking: split on sentence boundaries, merge short chunks
 - [x] Integration test: ingest 10k chunks, restart process, confirm persistence
 
@@ -149,7 +149,7 @@
 - [x] Implement `Reranker` struct wrapping secondary `ort::Session` (cross-encoder: query and passage as one sequence)
 - [x] Gate behind feature flag: `#[cfg(feature = "reranking")]`
 - [x] Add `query_reranked(text, top_k, rerank_top_n)` to `RAGLite`
-- [ ] Benchmark: measure latency budget for reranking step (not started; see 6E)
+- [x] Benchmark: reranking latency, measured with `examples/bench_search` on the README corpus (43 chunks, 20 candidates, release build, this machine): vector p50 4.95 ms, hybrid p50 4.96 ms, reranked p50 780 ms (p95 874 ms). The cross-encoder already runs in batches, so the cost is the model on CPU. Reranking needs fewer candidates or a smaller model to get faster
 
 ### Custom Embedding Models
 

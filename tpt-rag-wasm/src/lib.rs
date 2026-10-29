@@ -77,6 +77,22 @@ impl TptRag {
         to_json(&self.engine.keyword(text, top_k))
     }
 
+    /// Vector and keyword results fused with reciprocal rank fusion, as in the native
+    /// `query_hybrid`. `alpha` is the vector weight from 0 to 1. Returns JSON.
+    pub fn hybrid(
+        &self,
+        vector: &[f32],
+        text: &str,
+        top_k: usize,
+        alpha: f32,
+    ) -> Result<String, JsValue> {
+        let hits = self
+            .engine
+            .hybrid(vector, text, top_k, alpha)
+            .map_err(to_js_error)?;
+        to_json(&hits)
+    }
+
     /// Removes every chunk stored for `source`. Returns how many were removed.
     pub fn delete(&mut self, source: &str) -> Result<usize, JsValue> {
         self.engine.delete(source).map_err(to_js_error)

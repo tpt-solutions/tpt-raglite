@@ -34,8 +34,10 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     let (a_main, a_tail) = a[..n].split_at(main);
     let (b_main, b_tail) = b[..n].split_at(main);
 
+    let (a_chunks, _) = a_main.as_chunks::<8>();
+    let (b_chunks, _) = b_main.as_chunks::<8>();
     let mut lanes = [0.0f32; 8];
-    for (ca, cb) in a_main.chunks_exact(8).zip(b_main.chunks_exact(8)) {
+    for (ca, cb) in a_chunks.iter().zip(b_chunks) {
         for (lane, (x, y)) in lanes.iter_mut().zip(ca.iter().zip(cb)) {
             *lane += x * y;
         }
