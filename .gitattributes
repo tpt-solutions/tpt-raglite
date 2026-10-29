@@ -1,0 +1,4 @@
+# PDFs are binary. Without this, git can rewrite LF to CRLF on Windows
+# checkouts (core.autocrlf), which shifts the xref offsets and makes the
+# fixtures unparseable.
+*.pdf binary
